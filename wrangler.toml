@@ -32,6 +32,11 @@ PROFILE_ID = "1"
 # with posters/names. Optional.
 # CINEMETA = "https://v3-cinemeta.strem.fun"
 
+# Optional: pin the /login endpoint (used by the site's sign-in form) to your
+# GitHub Pages origin so the Worker cannot be abused as a generic Nuvio
+# credential-checking oracle. Set AFTER Pages is live, e.g.:
+# ALLOWED_ORIGIN = "https://vijay3695.github.io"
+
 # ---------------------------------------------------------------------------
 # SECRETS (set with:  npx wrangler secret put NUVIO_PUB_KEY)
 # ---------------------------------------------------------------------------

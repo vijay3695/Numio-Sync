@@ -180,16 +180,22 @@
 
   <!-- ================= STEP 1: connect ================= -->
   <section class="card">
-    <h2><span class="num">1</span> Connect your Nuvio account</h2>
-    <p class="sub">Your token is used only to talk to Nuvio&rsquo;s API. Nothing is stored on any server.</p>
+    <h2><span class="num">1</span> Sign in to Nuvio</h2>
+    <p class="sub">The same login you use in the Nuvio app. Your password is sent to
+       this Worker only to exchange it for a Nuvio token &mdash; it is never stored,
+       never logged, and the token stays in your browser.</p>
 
     <div class="row">
       <div>
-        <label for="token">Nuvio Access Token</label>
-        <input id="token" type="text" placeholder="paste your Nuvio access token" autocomplete="off" spellcheck="false" />
+        <label for="email">Nuvio email</label>
+        <input id="email" type="email" placeholder="you@example.com" autocomplete="username" spellcheck="false" />
       </div>
       <div>
-        <label for="profile">Nuvio profile # (1&ndash;6)</label>
+        <label for="password">Password</label>
+        <input id="password" type="password" placeholder="your Nuvio password" autocomplete="current-password" />
+      </div>
+      <div style="flex:0 0 110px">
+        <label for="profile">Profile #</label>
         <input id="profile" type="number" min="1" max="6" step="1" value="1" />
       </div>
     </div>
@@ -199,12 +205,22 @@
            autocomplete="off" spellcheck="false" />
 
     <div class="row" style="margin-top:16px">
-      <button id="generate" class="btn-primary">Generate add-on URL</button>
-      <button id="test" class="btn-ghost" disabled>Test token</button>
+      <button id="signin" class="btn-primary">Sign in</button>
       <button id="reset" class="btn-ghost" type="button">Clear saved</button>
     </div>
 
-    <div id="testStatus" class="status"></div>
+    <div id="signinStatus" class="status"></div>
+    <div id="signedInAs" class="status" style="display:none">
+      Signed in &mdash; <button id="generate" class="btn-primary" style="margin-left:8px">Generate add-on URL</button>
+    </div>
+
+    <details style="margin-top:14px;background:none;border:none;padding:0">
+      <summary style="font-size:13px;color:var(--text-dim)">Advanced: paste an access token instead</summary>
+      <div style="margin-top:10px">
+        <input id="token" type="text" placeholder="paste a Nuvio access token" autocomplete="off" spellcheck="false" />
+        <button id="useToken" class="btn-ghost" style="margin-top:8px">Use this token</button>
+      </div>
+    </details>
 
     <div id="urlbox" class="urlbox">
       <label>Your personal add-on URL &mdash; install this in both Stremio and Nuvio</label>
@@ -314,13 +330,17 @@
 
   // ---- Element handles -----------------------------------------------------
   var $ = function (id) { return document.getElementById(id); };
-  var tokenInput = $("token");
+  var emailInput = $("email");
+  var passwordInput = $("password");
   var profileInput = $("profile");
   var workerInput = $("worker");
-  var generateBtn = $("generate");
-  var testBtn = $("test");
+  var tokenInput = $("token");
+  var signinBtn = $("signin");
+  var useTokenBtn = $("useToken");
   var resetBtn = $("reset");
-  var testStatus = $("testStatus");
+  var signinStatus = $("signinStatus");
+  var signedInAs = $("signedInAs");
+  var generateBtn = $("generate");
   var urlBox = $("urlbox");
   var addonUrlInput = $("addonUrl");
   var copyBtn = $("copy");
@@ -329,6 +349,13 @@
 
   var LS_KEY = "nuvio-sync-prefs";
 
+  /**
+   * The Nuvio access token, held in memory only.
+   * Deliberately NOT written to localStorage: it is a bearer credential with
+   * a ~1 hour lifetime, so persisting it buys nothing and costs exposure.
+   */
+  var accessToken = null;
+
   // ---- Persistence (this browser only, for convenience) --------------------
   function loadPrefs() {
     try {
@@ -336,7 +363,6 @@
       if (!raw) return;
       var prefs = JSON.parse(raw);
       if (prefs.worker) workerInput.value = prefs.worker;
-      if (prefs.token) tokenInput.value = prefs.token;
       if (prefs.profile) profileInput.value = prefs.profile;
     } catch (e) { /* storage unavailable - ignore */ }
   }
@@ -344,7 +370,6 @@
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({
         worker: workerInput.value.trim(),
-        token: tokenInput.value.trim(),
         profile: profileInput.value
       }));
     } catch (e) { /* storage unavailable - ignore */ }
@@ -354,7 +379,7 @@
   /**
    * Build the addon manifest URL.
    *
-   * Shape:  https://<worker>/t/<nuvioToken>@<profile>/manifest.json
+   * Shape:  https://<worker>/t/<accessToken>@<profile>/manifest.json
    *
    * Why the token is in the PATH and not the query string: Stremio's HTTP
    * transport derives every subsequent resource request from the directory
@@ -362,19 +387,88 @@
    * automatically re-appended to every player/catalog/library request.
    * Query strings on the manifest URL are NOT preserved by the client.
    *
-   * encodeURIComponent keeps tokens with unusual characters URL-safe.
+   * encodeURIComponent keeps tokens with unusual characters URL-safe; the
+   * Worker decodes each path segment before using it.
    */
-  function buildAddonUrl() {
+  function buildAddonUrl(token) {
     var worker = workerInput.value.trim().replace(/\/+$/, "");
-    var token = encodeURIComponent(tokenInput.value.trim());
     var profile = parseInt(profileInput.value, 10) || 1;
-    return worker + "/t/" + token + "@" + profile + "/manifest.json";
+    return worker + "/t/" + encodeURIComponent(token) + "@" + profile + "/manifest.json";
   }
 
   // ---- Status helper ---------------------------------------------------------
   function setStatus(el, msg, kind) {
-    el.textContent = msg;
+    el.innerHTML = msg;
     el.className = "status show " + (kind || "");
+  }
+
+  // ---- Sign in ---------------------------------------------------------------
+  /**
+   * Exchange the user's Nuvio credentials for an access token via the
+   * Worker's /login endpoint:
+   *
+   *   POST <worker>/login  { email, password }
+   *     -> Worker calls api.nuvio.tv/auth/v1/token?grant_type=password
+   *     -> returns ONLY { access_token, expires_in, profiles }
+   *
+   * The password is used once and discarded by the Worker; nothing is
+   * stored server-side. The returned token is kept in memory (never in
+   * localStorage) and embedded only in the addon URL the user installs.
+   */
+  function signIn() {
+    var worker = workerInput.value.trim().replace(/\/+$/, "");
+    var email = emailInput.value.trim();
+    var password = passwordInput.value;
+    if (!worker) { setStatus(signinStatus, "Enter the Sync Worker URL first.", "err"); return; }
+    if (!email || !password) { setStatus(signinStatus, "Enter your Nuvio email and password.", "err"); return; }
+
+    savePrefs();
+    signinBtn.disabled = true;
+    setStatus(signinStatus, "Signing in&hellip;", "");
+    passwordInput.value = ""; // never keep the password in the DOM
+
+    fetch(worker + "/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, password: password })
+    })
+      .then(function (res) {
+        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+      })
+      .then(function (r) {
+        if (r.ok && r.body && r.body.ok && r.body.access_token) {
+          accessToken = r.body.access_token;
+          var names = Array.isArray(r.body.profiles) && r.body.profiles.length
+            ? r.body.profiles.map(function (p) { return escapeHtml(p.name || "Profile") + " #" + escapeHtml(p.index); }).join(", ")
+            : null;
+          setStatus(signinStatus,
+            "Signed in" + (names ? " &mdash; profiles: " + names : "") +
+            ". Token is valid for " + Math.round((r.body.expires_in || 3600) / 60) + " minutes; " +
+            "if syncing stops later, sign in again to refresh it.", "ok");
+          signedInAs.style.display = "block";
+        } else {
+          setStatus(signinStatus, "Sign-in failed" + (r.body && r.body.error ? ": " + escapeHtml(r.body.error) : ""), "err");
+        }
+      })
+      .catch(function () {
+        setStatus(signinStatus, "Could not reach the Worker. Check the URL.", "err");
+      })
+      .then(function () { signinBtn.disabled = false; });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // ---- Advanced manual-token path --------------------------------------------
+  function useManualToken() {
+    var t = tokenInput.value.trim();
+    if (!t) { setStatus(signinStatus, "Paste a token first.", "err"); return; }
+    accessToken = t;
+    setStatus(signinStatus, "Using the pasted token.", "ok");
+    signedInAs.style.display = "block";
   }
 
   // ---- QR code (optional enhancement) ---------------------------------------
@@ -388,63 +482,33 @@
     } catch (e) { /* ignore */ }
   }
 
-  // ---- Test the token against the Worker's /health probe ---------------------
-  function testToken() {
-    var worker = workerInput.value.trim().replace(/\/+$/, "");
-    var token = tokenInput.value.trim();
-    if (!worker || !token) {
-      setStatus(testStatus, "Enter both the Worker URL and your Nuvio token first.", "err");
-      return;
-    }
-    setStatus(testStatus, "Testing token&hellip;", "");
-    testBtn.disabled = true;
-
-    var profile = parseInt(profileInput.value, 10) || 1;
-    // encodeURIComponent keeps tokens with '@', '/', '?' etc. URL-safe - the
-    // Worker decodes each path segment before using it.
-    fetch(worker + "/t/" + encodeURIComponent(token) + "@" + profile + "/health")
-      .then(function (res) {
-        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
-      })
-      .then(function (r) {
-        if (r.ok && r.body && r.body.ok) {
-          var names = Array.isArray(r.body.profiles)
-            ? r.body.profiles.map(function (p) { return (p.name || "profile") + " #" + p.profile_index; }).join(", ")
-            : "connected";
-          setStatus(testStatus, "Token valid &mdash; " + names, "ok");
-        } else {
-          setStatus(testStatus, "Nuvio rejected the token" + (r.body && r.body.error ? ": " + r.body.error : ""), "err");
-        }
-      })
-      .catch(function () {
-        setStatus(testStatus, "Could not reach the Worker. Check the URL.", "err");
-      })
-      .then(function () { testBtn.disabled = false; });
-  }
-
   // ---- Generate ---------------------------------------------------------------
   function generate() {
-    if (!workerInput.value.trim() || !tokenInput.value.trim()) {
-      setStatus(testStatus, "Enter both the Worker URL and your Nuvio token first.", "err");
+    if (!accessToken) {
+      setStatus(signinStatus, "Sign in to Nuvio first.", "err");
       return;
     }
-    savePrefs();
-    var url = buildAddonUrl();
+    var url = buildAddonUrl(accessToken);
     addonUrlInput.value = url;
     urlBox.classList.add("show");
     installCard.style.display = "block";
     renderQr(url);
-    setStatus(testStatus, "", "");
   }
 
   // ---- Wiring -----------------------------------------------------------------
-  generateBtn.addEventListener("click", generate);
-  testBtn.addEventListener("click", function () { savePrefs(); testToken(); });
+  signinBtn.addEventListener("click", signIn);
+  // Enter in the password field submits.
+  passwordInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") signIn();
+  });
+  useTokenBtn.addEventListener("click", useManualToken);
   resetBtn.addEventListener("click", function () {
     try { localStorage.removeItem(LS_KEY); } catch (e) {}
-    tokenInput.value = ""; profileInput.value = "1";
+    emailInput.value = ""; passwordInput.value = ""; profileInput.value = "1";
+    accessToken = null;
+    signedInAs.style.display = "none";
     urlBox.classList.remove("show"); installCard.style.display = "none";
-    setStatus(testStatus, "Saved details cleared.", "");
+    setStatus(signinStatus, "Saved details cleared.", "");
   });
   copyBtn.addEventListener("click", function () {
     addonUrlInput.select();
@@ -455,13 +519,9 @@
       document.execCommand("copy"); done();
     }
   });
-  // Enable the Test button as soon as both fields have content.
-  function refreshTestState() { testBtn.disabled = !(workerInput.value.trim() && tokenInput.value.trim()); }
-  workerInput.addEventListener("input", refreshTestState);
-  tokenInput.addEventListener("input", refreshTestState);
+  generateBtn.addEventListener("click", generate);
 
   loadPrefs();
-  refreshTestState();
 })();
 </script>
 </body>

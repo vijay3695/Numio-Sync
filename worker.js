@@ -93,12 +93,16 @@ const META_TTL_MS = 10 * 60 * 1000;
 // SMALL HELPERS
 // ---------------------------------------------------------------------------
 
-/** CORS is mandatory: "each route, including /manifest.json, must serve
- *  CORS headers that allow all origins" - Stremio protocol doc. */
+/**
+ * CORS is mandatory: "each route, including /manifest.json, must serve
+ * CORS headers that allow all origins" - Stremio protocol doc. POST is
+ * included because the /login endpoint (used by the GitHub Pages sign-in
+ * form) is a cross-origin POST from the Pages origin.
+ */
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS',
-  'Access-Control-Allow-Headers': '*',
+  'Access-Control-Allow-Methods': 'GET,HEAD,POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
 };
 
 /** Build a JSON response with the mandatory CORS headers. */
@@ -174,6 +178,9 @@ function getConfig(env) {
     nuvioKey: env.NUVIO_PUB_KEY || NUVIO_PUBLISHABLE_KEY_DEFAULT,
     cinemeta: (env.CINEMETA || CINEMETA_DEFAULT).replace(/\/+$/, ''),
     defaultProfileId: toInt(env.PROFILE_ID, DEFAULT_PROFILE_ID) || DEFAULT_PROFILE_ID,
+    // Optional: pin the /login endpoint to your GitHub Pages origin so it
+    // cannot be used as a generic Nuvio credential-checking oracle.
+    allowedOrigin: (env.ALLOWED_ORIGIN || '').replace(/\/+$/, '') || null,
   };
 }
 
@@ -269,6 +276,124 @@ async function pullWatched(cfg, token, profileId, limit = CATALOG_LIMIT) {
     p_limit: limit,
   });
   return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Nuvio email+password login (Supabase-compatible endpoint).
+ *
+ * POST {base}/auth/v1/token?grant_type=password
+ *   apikey: <publishable key>
+ *   { email, password }
+ * -> { access_token, refresh_token, expires_in, user }
+ *
+ * This powers the "Sign in to Nuvio" form on the GitHub Pages site so users
+ * never have to hunt for an access token (Nuvio shows it nowhere). The
+ * Worker uses the credentials exactly once and returns ONLY the access
+ * token to the page - the password is discarded immediately, the refresh
+ * token is never forwarded (rotating, single-use, useless in a stateless
+ * URL), and nothing is stored or logged.
+ */
+async function nuvioPasswordLogin(cfg, email, password) {
+  const res = await fetch(`${cfg.nuvioBase}/auth/v1/token?grant_type=password`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': cfg.nuvioKey,
+    },
+    body: JSON.stringify({ email, password }),
+  });
+
+  const text = await res.text();
+  const data = safeJsonParse(text);
+
+  if (!res.ok) {
+    let message;
+    if (res.status === 400 || res.status === 401) {
+      message = 'Invalid email or password';
+    } else if (res.status === 429) {
+      message = 'Too many attempts - wait a minute and try again';
+    } else {
+      message = `Nuvio sign-in failed (${res.status})`;
+    }
+    const err = new Error(message);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+/** Map a Supabase-style auth error to a human message. */
+function loginErrorMessage(err) {
+  return (err && err.message) || 'Sign-in failed';
+}
+
+/**
+ * POST /login - the GitHub Pages sign-in form's endpoint.
+ *
+ * Body: { email, password }
+ * Response: { ok, access_token, expires_in, profiles }
+ *
+ * The access_token is what the page embeds in the generated addon URL;
+ * profiles are returned so the UI can show real profile names.
+ */
+async function handleLogin(request, cfg) {
+  // Optional origin pinning: set ALLOWED_ORIGIN to your GitHub Pages origin
+  // (e.g. https://vijay3695.github.io) to stop this endpoint being used as a
+  // generic Nuvio credential-checking oracle. Empty by default.
+  const allowed = cfg.allowedOrigin;
+  if (allowed) {
+    const origin = request.headers.get('Origin') || '';
+    if (origin !== allowed) {
+      return json({ ok: false, error: 'origin_not_allowed' }, 403);
+    }
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: 'invalid_body' }, 400);
+  }
+
+  const email = String(body.email || '').trim();
+  const password = String(body.password || '');
+  if (!email || !password) {
+    return json({ ok: false, error: 'email_and_password_required' }, 400);
+  }
+
+  let session;
+  try {
+    session = await nuvioPasswordLogin(cfg, email, password);
+  } catch (err) {
+    return json({ ok: false, error: loginErrorMessage(err) }, err.status || 502);
+  }
+
+  const accessToken = session && session.access_token;
+  if (!accessToken) {
+    return json({ ok: false, error: 'no_token_in_response' }, 502);
+  }
+
+  // Pull profile names with the brand-new token so the UI can label the
+  // profile picker ("Main #1, Kids #2"). A failure here is not fatal - the
+  // user can still pick a number.
+  let profiles = [];
+  try {
+    const rows = await nuvioRpc(cfg, accessToken, 'sync_pull_profiles', {});
+    if (Array.isArray(rows)) {
+      profiles = rows.map((p) => ({ name: p.name, index: p.profile_index }));
+    }
+  } catch {
+    /* profile listing is best-effort */
+  }
+
+  // NOTE: only the access token is returned. No refresh token, no password,
+  // no user payload, and nothing is written to any store.
+  return json({
+    ok: true,
+    access_token: accessToken,
+    expires_in: session.expires_in || 3600,
+    profiles,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +681,17 @@ export default {
     // ---- CORS preflight (protocol mandates it on every route) ----
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // ---- Login endpoint (GitHub Pages sign-in form) ----
+    // Must be matched before the /t/<token> routing below: it takes
+    // credentials in the body, not a token in the path.
+    const bare = url.pathname.replace(/^\/+|\/+$/g, '');
+    if (bare === 'login' || bare.endsWith('/login')) {
+      if (request.method !== 'POST') {
+        return json({ error: 'method_not_allowed', hint: 'POST { email, password }' }, 405);
+      }
+      return handleLogin(request, cfg);
     }
 
     try {
