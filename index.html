@@ -200,10 +200,6 @@
       </div>
     </div>
 
-    <label for="worker">Sync Worker URL <span style="opacity:.6">(your deployed Cloudflare Worker)</span></label>
-    <input id="worker" type="text" value="https://numio-sync.vijaykumar-f83.workers.dev"
-           autocomplete="off" spellcheck="false" />
-
     <div class="row" style="margin-top:16px">
       <button id="signin" class="btn-primary">Sign in</button>
       <button id="reset" class="btn-ghost" type="button">Clear saved</button>
@@ -333,8 +329,14 @@
   var emailInput = $("email");
   var passwordInput = $("password");
   var profileInput = $("profile");
-  var workerInput = $("worker");
   var tokenInput = $("token");
+
+  /**
+   * The deployed Cloudflare Worker. Hardcoded so users never see or type a
+   * backend URL - the page only asks for their Nuvio credentials.
+   * If the Worker is ever redeployed to a new address, change this one line.
+   */
+  var WORKER_URL = "https://numio-sync.vijaykumar-f83.workers.dev";
   var signinBtn = $("signin");
   var useTokenBtn = $("useToken");
   var resetBtn = $("reset");
@@ -362,14 +364,12 @@
       var raw = localStorage.getItem(LS_KEY);
       if (!raw) return;
       var prefs = JSON.parse(raw);
-      if (prefs.worker) workerInput.value = prefs.worker;
       if (prefs.profile) profileInput.value = prefs.profile;
     } catch (e) { /* storage unavailable - ignore */ }
   }
   function savePrefs() {
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({
-        worker: workerInput.value.trim(),
         profile: profileInput.value
       }));
     } catch (e) { /* storage unavailable - ignore */ }
@@ -391,7 +391,7 @@
    * Worker decodes each path segment before using it.
    */
   function buildAddonUrl(token) {
-    var worker = workerInput.value.trim().replace(/\/+$/, "");
+    var worker = WORKER_URL;
     var profile = parseInt(profileInput.value, 10) || 1;
     return worker + "/t/" + encodeURIComponent(token) + "@" + profile + "/manifest.json";
   }
@@ -416,10 +416,10 @@
    * localStorage) and embedded only in the addon URL the user installs.
    */
   function signIn() {
-    var worker = workerInput.value.trim().replace(/\/+$/, "");
+    var worker = WORKER_URL;
     var email = emailInput.value.trim();
     var password = passwordInput.value;
-    if (!worker) { setStatus(signinStatus, "Enter the Sync Worker URL first.", "err"); return; }
+    if (!WORKER_URL) { setStatus(signinStatus, "Worker URL not configured.", "err"); return; }
     if (!email || !password) { setStatus(signinStatus, "Enter your Nuvio email and password.", "err"); return; }
 
     savePrefs();

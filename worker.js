@@ -73,8 +73,20 @@ const NUVIO_PUBLISHABLE_KEY_DEFAULT = 'sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xU
 /** Nuvio API base - all sync RPCs live under {base}/rest/v1/rpc/... */
 const NUVIO_BASE_DEFAULT = 'https://api.nuvio.tv';
 
-/** Cinemeta: used to decorate the Continue Watching catalog with posters. */
-const CINEMETA_DEFAULT = 'https://v3-cinemeta.strem.fun';
+/**
+ * Metadata providers, tried in order until one answers.
+ *
+ * Cinemeta is the default Stremio metadata source, but it is a single third
+ * party that goes down (all strem.fun mirrors returning 530 at once). TMDB
+ * is used as a reliable fallback when NUVIO_TMDB_KEY (a free TMDB API key)
+ * is configured - without a key only the Cinemeta mirrors are used.
+ */
+const CINEMETA_MIRRORS = [
+  'https://v3-cinemeta.strem.fun',
+  'https://v2-cinemeta.strem.fun',
+  'https://cinemeta.strem.fun',
+];
+const TMDB_API_DEFAULT = 'https://api.themoviedb.org/3';
 
 /** Profile used when the install URL does not carry `@<profile>`. */
 const DEFAULT_PROFILE_ID = 1;
@@ -83,11 +95,16 @@ const DEFAULT_PROFILE_ID = 1;
 const CATALOG_LIMIT = 40;
 
 /**
- * Per-isolate in-memory cache for Cinemeta metadata lookups.
+ * Per-isolate in-memory cache for metadata lookups (and their failures).
  * Purely an optimization; a cold isolate simply refetches.
+ *
+ * Failures get a SHORT ttl (negative cache): when a provider is down we must
+ * not retry it on every catalog render - a 40-item row would otherwise mean
+ * 40+ doomed requests to a dead origin on every single page load.
  */
 const metaCache = new Map(); // key -> { expires, value }
 const META_TTL_MS = 10 * 60 * 1000;
+const META_FAIL_TTL_MS = 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // SMALL HELPERS
@@ -176,8 +193,11 @@ function getConfig(env) {
   return {
     nuvioBase: (env.NUVIO_BASE || NUVIO_BASE_DEFAULT).replace(/\/+$/, ''),
     nuvioKey: env.NUVIO_PUB_KEY || NUVIO_PUBLISHABLE_KEY_DEFAULT,
-    cinemeta: (env.CINEMETA || CINEMETA_DEFAULT).replace(/\/+$/, ''),
     defaultProfileId: toInt(env.PROFILE_ID, DEFAULT_PROFILE_ID) || DEFAULT_PROFILE_ID,
+    // Optional free TMDB API key (themoviedb.org) - enables TMDB as a
+    // metadata fallback when all Cinemeta mirrors are down.
+    tmdbKey: env.NUVIO_TMDB_KEY || env.TMDB_API_KEY || null,
+    tmdbBase: (env.TMDB_API_BASE || TMDB_API_DEFAULT).replace(/\/+$/, ''),
     // Optional: pin the /login endpoint to your GitHub Pages origin so it
     // cannot be used as a generic Nuvio credential-checking oracle.
     allowedOrigin: (env.ALLOWED_ORIGIN || '').replace(/\/+$/, '') || null,
@@ -589,7 +609,7 @@ async function handleCatalog(type, catalogId, cfg, token, profileId) {
     if (row.content_type && row.content_type !== wantedType) continue;
     if (!row.content_id) continue;
 
-    const meta = await fetchCinemetaMeta(cfg, wantedType, row.content_id);
+    const meta = await fetchMeta(cfg, wantedType, row.content_id);
     const base = {
       id: row.content_id,
       type: wantedType,
@@ -619,27 +639,93 @@ async function handleCatalog(type, catalogId, cfg, token, profileId) {
   return json({ metas: metas.slice(0, CATALOG_LIMIT) });
 }
 
-/** Cinemeta lookup with a short per-isolate cache (decorates posters only). */
-async function fetchCinemetaMeta(cfg, type, id) {
-  const key = `${type}:${id}`;
+/**
+ * Look up metadata for an IMDb tt id, trying providers in order:
+ *   1. Cinemeta mirrors (keyless, the Stremio default)
+ *   2. TMDB (only when a free TMDB API key is configured)
+ *
+ * Results - including failures - are cached per isolate. A provider outage
+ * therefore costs at most one doomed request per minute, not one per item:
+ * without the negative cache a 40-item catalog row would fire 40+ doomed
+ * requests at a dead origin on every single page load.
+ *
+ * Returns a Stremio-shaped meta object ({ id, type, name, poster, ... }) or
+ * null when every provider fails.
+ */
+async function fetchMeta(cfg, type, id) {
+  const key = `meta:${type}:${id}`;
   const hit = metaCache.get(key);
   if (hit && hit.expires > Date.now()) return hit.value;
 
-  try {
-    const res = await fetch(`${cfg.cinemeta}/meta/${type}/${id}.json`, {
-      headers: { 'User-Agent': 'stremio-nuvio-sync/1.0' },
-    });
-    if (!res.ok) {
-      metaCache.set(key, { expires: Date.now() + 60_000, value: null });
-      return null;
+  for (const base of CINEMETA_MIRRORS) {
+    try {
+      const res = await fetch(`${base}/meta/${type}/${id}.json`, {
+        headers: { 'User-Agent': 'stremio-nuvio-sync/1.0' },
+      });
+      if (!res.ok) continue; // mirror down - try the next one
+      const data = await res.json();
+      const meta = data && data.meta ? { ...data.meta, id, type } : { id, type };
+      metaCache.set(key, { expires: Date.now() + META_TTL_MS, value: meta });
+      return meta;
+    } catch {
+      /* try next mirror */
     }
-    const data = await res.json();
-    const meta = data && data.meta ? data.meta : null;
-    metaCache.set(key, { expires: Date.now() + META_TTL_MS, value: meta });
-    return meta;
-  } catch {
-    return null;
   }
+
+  // TMDB fallback (needs a free key; find by IMDb id).
+  if (cfg.tmdbKey) {
+    try {
+      const res = await fetch(`${cfg.tmdbBase}/find/${id}?external_source=imdb_id`, {
+        headers: { 'Authorization': `Bearer ${cfg.tmdbKey}`, 'User-Agent': 'stremio-nuvio-sync/1.0' },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const bucket = type === 'series' ? data.tv_results : data.movie_results;
+        const item = Array.isArray(bucket) && bucket.length ? bucket[0] : null;
+        if (item) {
+          const meta = {
+            id,
+            type,
+            name: item.name || item.title || id,
+            poster: item.poster_path ? `https://image.tmdb.org/t/p/w300${item.poster_path}` : undefined,
+            background: item.backdrop_path ? `https://image.tmdb.org/t/p/w1280${item.backdrop_path}` : undefined,
+            description: item.overview || undefined,
+            releaseInfo: (item.first_air_date || item.release_date || '').slice(0, 4) || undefined,
+            imdbRating: item.vote_average ? String(item.vote_average.toFixed(1)) : undefined,
+          };
+          metaCache.set(key, { expires: Date.now() + META_TTL_MS, value: meta });
+          return meta;
+        }
+      }
+    } catch {
+      /* TMDB unreachable */
+    }
+  }
+
+  // Negative-cache the failure briefly so a dead origin is not retried on
+  // every catalog render.
+  metaCache.set(key, { expires: Date.now() + META_FAIL_TTL_MS, value: null });
+  return null;
+}
+
+/**
+ * Route: /meta/{type}/{id}.json
+ *
+ * Serving our own metadata makes catalog items self-contained: when a user
+ * clicks an entry in the Continue Watching / Watched rows, the client asks
+ * US for the details instead of hunting through every other meta addon -
+ * which is exactly what made resolution take ~a minute when Cinemeta was
+ * down and the client kept retrying failing providers.
+ *
+ * Response shape follows the Stremio protocol: { "meta": {...} }.
+ */
+async function handleMetaRequest(type, id, cfg) {
+  const meta = await fetchMeta(cfg, type, id);
+  if (!meta) {
+    // Minimal but valid fallback so the client never hangs on us.
+    return json({ meta: { id, type, name: id } });
+  }
+  return json({ meta });
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +806,15 @@ export default {
       // ---- manifest ------------------------------------------------------
       if (!head || head === 'manifest.json' || head.startsWith('manifest.json?')) {
         return json(buildManifest());
+      }
+
+      // ---- meta (public data - no token required) --------------------------
+      // Metadata for our own catalog rows. Served WITHOUT a token: metadata
+      // is public data and the client may request it before/additions.
+      if (head === 'meta' && rest.length >= 3) {
+        const type = rest[1];
+        const id = rest[2].replace(/\.json$/i, '');
+        return await handleMetaRequest(type, id, cfg);
       }
 
       // Routes below all require a token; without one we cannot sync.
@@ -831,6 +926,10 @@ function buildManifest() {
     ],
     resources: [
       { name: 'catalog', types: ['movie', 'series'], idPrefixes: ['tt'] },
+      // Our own meta resource makes the Continue Watching / Watched rows
+      // self-contained: clicking an item resolves against us (with caching),
+      // so the client never has to hunt through other meta addons.
+      { name: 'meta', types: ['movie', 'series'], idPrefixes: ['tt'] },
       { name: 'stream', types: ['movie', 'series'], idPrefixes: ['tt'] },
       { name: 'player', types: ['movie', 'series'], idPrefixes: ['tt'] },
       { name: 'library', types: ['movie', 'series'], idPrefixes: ['tt'] },
