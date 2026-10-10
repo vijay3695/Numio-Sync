@@ -258,6 +258,19 @@ async function pushWatched(cfg, token, profileId, item) {
   });
 }
 
+/**
+ * Pull the user's watched history (most-recent first, paginated).
+ * Body: { p_profile_id, p_limit } - the same data shown on the account
+ * dashboard's "Watched" tab (nuvio.tv/accounts?tab=watched).
+ */
+async function pullWatched(cfg, token, profileId, limit = CATALOG_LIMIT) {
+  const rows = await nuvioRpc(cfg, token, 'sync_pull_watched_items', {
+    p_profile_id: profileId,
+    p_limit: limit,
+  });
+  return Array.isArray(rows) ? rows : [];
+}
+
 // ---------------------------------------------------------------------------
 // ID PARSING (Stremio ids -> Nuvio entries)
 // ---------------------------------------------------------------------------
@@ -419,7 +432,12 @@ function handleStreamRequest(type, id) {
 // ---------------------------------------------------------------------------
 
 /**
- * Turn the user's Nuvio progress rows into a Stremio catalog response.
+ * Turn the user's Nuvio data into Stremio catalog responses.
+ *
+ * Two rows are declared in the manifest:
+ *   - "Continue Watching (Nuvio)"  <- watch progress  (partial positions)
+ *   - "Watched (Nuvio)"            <- watch history   (completed items,
+ *                                     the account dashboard's Watched tab)
  *
  * This is the same mechanism the Letterboxd addons use (fetch external
  * account data, render it as a Stremio row) - except the source is the
@@ -427,17 +445,19 @@ function handleStreamRequest(type, id) {
  */
 async function handleCatalog(type, catalogId, cfg, token, profileId) {
   // Ignore catalogs we do not declare.
-  if (catalogId !== 'nuviocw') return json({ metas: [] });
+  if (catalogId !== 'nuviocw' && catalogId !== 'nuviowatched') return json({ metas: [] });
 
+  const wantedType = type === 'series' ? 'series' : 'movie';
   let rows = [];
   try {
-    rows = await pullProgress(cfg, token, profileId, CATALOG_LIMIT);
+    rows = catalogId === 'nuviocw'
+      ? await pullProgress(cfg, token, profileId, CATALOG_LIMIT)
+      : await pullWatched(cfg, token, profileId, CATALOG_LIMIT);
   } catch (err) {
     console.error(`[catalog] pull failed: ${err.message}`);
     return json({ metas: [] }); // degrade to empty rather than erroring the UI
   }
 
-  const wantedType = type === 'series' ? 'series' : 'movie';
   const metas = [];
 
   for (const row of rows) {
@@ -445,23 +465,30 @@ async function handleCatalog(type, catalogId, cfg, token, profileId) {
     if (!row.content_id) continue;
 
     const meta = await fetchCinemetaMeta(cfg, wantedType, row.content_id);
-
-    const position = toInt(row.position, 0);
-    const duration = toInt(row.duration, 0);
-    const pct = duration > 0 ? Math.min(100, Math.round((position / duration) * 100)) : null;
-
-    metas.push({
+    const base = {
       id: row.content_id,
       type: wantedType,
       name: (meta && meta.name) || row.content_id,
       poster: (meta && meta.poster) || undefined,
       posterShape: 'poster',
-      // Stremio does not render raw progress in previews, so we surface the
-      // resume state in the description; the real resume value lives in the
-      // user's Nuvio account (and Nuvio's own Continue Watching row).
-      description: pct !== null ? `Nuvio: ${pct}% watched` : 'Nuvio: in progress',
       releaseInfo: (meta && meta.releaseInfo) || undefined,
-    });
+    };
+
+    if (catalogId === 'nuviocw') {
+      // Progress row: surface the resume point as a percentage.
+      const position = toInt(row.position, 0);
+      const duration = toInt(row.duration, 0);
+      const pct = duration > 0 ? Math.min(100, Math.round((position / duration) * 100)) : null;
+      base.description = pct !== null ? `Nuvio: ${pct}% watched` : 'Nuvio: in progress';
+    } else {
+      // Watched row: show when it was completed, if Nuvio recorded it.
+      const at = toInt(row.watched_at, 0);
+      base.description = at > 0
+        ? `Watched on ${new Date(at).toISOString().slice(0, 10)}`
+        : 'Watched';
+    }
+
+    metas.push(base);
   }
 
   return json({ metas: metas.slice(0, CATALOG_LIMIT) });
@@ -651,6 +678,18 @@ function buildManifest() {
         type: 'series',
         id: 'nuviocw',
         name: 'Continue Watching (Nuvio)',
+        extra: [{ name: 'skip', isRequired: false }],
+      },
+      {
+        type: 'movie',
+        id: 'nuviowatched',
+        name: 'Watched (Nuvio)',
+        extra: [{ name: 'skip', isRequired: false }],
+      },
+      {
+        type: 'series',
+        id: 'nuviowatched',
+        name: 'Watched (Nuvio)',
         extra: [{ name: 'skip', isRequired: false }],
       },
     ],

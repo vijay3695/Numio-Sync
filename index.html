@@ -235,7 +235,8 @@
     <ol class="steps" style="margin-top:20px">
       <li><b>Stremio (Desktop / Web / Android / TV):</b>
         open <code>Addons</code> &rarr; paste the URL above &rarr; Install.
-        You should see a new <i>Continue Watching (Nuvio)</i> row.</li>
+        You should see two new rows: <i>Continue Watching (Nuvio)</i> and
+        <i>Watched (Nuvio)</i>.</li>
       <li><b>Nuvio (Android / TV / Desktop):</b>
         <code>Settings &rarr; Content &amp; Discovery &rarr; Addons</code> &rarr;
         paste the same URL into <i>Add Addon</i> &rarr; Install.</li>
@@ -276,6 +277,10 @@
       <tr>
         <td><code>/catalog/movie/nuviocw.json</code> (you opening Stremio)</td>
         <td>Pulls your Nuvio progress and renders the <i>Continue Watching (Nuvio)</i> row.</td>
+      </tr>
+      <tr>
+        <td><code>/catalog/movie/nuviowatched.json</code></td>
+        <td>Pulls your Nuvio watch history and renders the <i>Watched (Nuvio)</i> row &mdash; the same list as the <i>Watched</i> tab on your Nuvio account dashboard.</td>
       </tr>
     </table>
 
