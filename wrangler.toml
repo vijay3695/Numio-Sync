@@ -8,7 +8,7 @@
 #
 # Free tier: 100k requests/day, no cold starts, no credit card.
 
-name = "stremio-nuvio-sync"
+name = "numio-sync"
 main = "worker.js"
 compatibility_date = "2026-01-01"
 
