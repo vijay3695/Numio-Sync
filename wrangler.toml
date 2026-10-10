@@ -1,14 +1,22 @@
 # wrangler.toml - Cloudflare Worker deployment config
 #
 # Deploy:  npx wrangler deploy
-# Logs:    npx wrangler tail      (watch [player] events arrive live)
+# Verify:  npx wrangler tail      (REQUIRES [observability] below - without it,
+#                                 console.log output is not collected and the
+#                                 tail log stays empty, so you cannot confirm
+#                                 that player events are arriving)
 #
-# Free tier: 100k requests/day, no cold starts - enough for tens of
-# thousands of playback events daily.
+# Free tier: 100k requests/day, no cold starts, no credit card.
 
 name = "stremio-nuvio-sync"
 main = "worker.js"
-compatibility_date = "2025-01-01"
+compatibility_date = "2026-01-01"
+
+# ---------------------------------------------------------------------------
+# OBSERVABILITY (critical for the wrangler tail verification step)
+# ---------------------------------------------------------------------------
+[observability]
+enabled = true
 
 # ---------------------------------------------------------------------------
 # VARIABLES (plain, non-secret)
