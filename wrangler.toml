@@ -28,10 +28,10 @@ NUVIO_BASE = "https://api.nuvio.tv"
 # Nuvio profile used when the install URL does not carry `@<profile>` (1-6)
 PROFILE_ID = "1"
 
-# OPTIONAL: a free TMDB API key (themoviedb.org/settings/api) used as a
-# metadata fallback when all Cinemeta mirrors are down. Strongly recommended
-# - Cinemeta is a single third party with no SLA and goes down entirely for
-# hours at a time (it 530d on every mirror on 2026-10-10).
+# OPTIONAL last-resort metadata key. Not needed for normal operation: the
+# addon resolves metadata from the USER'S OWN installed addons (their Nuvio
+# account's addon list) before ever touching a third party. This is only a
+# final fallback when the user has no meta-capable addon installed.
 # NUVIO_TMDB_KEY = "your-tmdb-key"
 
 # Optional: pin the /login endpoint (used by the site's sign-in form) to your
