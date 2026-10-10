@@ -28,6 +28,16 @@ NUVIO_BASE = "https://api.nuvio.tv"
 # Nuvio profile used when the install URL does not carry `@<profile>` (1-6)
 PROFILE_ID = "1"
 
+# Stremio account API (library write-back - makes Nuvio progress resumable
+# inside Stremio). Default is the public api.strem.io; only change this if
+# you ever proxy it yourself.
+# STREMIO_API = "https://api.strem.io/api"
+
+# true  = resume points stored as temp library items (default; keeps the
+#         user's library clean while still resuming)
+# false = also pin the titles into the user's library
+# STREMIO_PROGRESS_TEMP = "true"
+
 # OPTIONAL last-resort metadata key. Not needed for normal operation: the
 # addon resolves metadata from the USER'S OWN installed addons (their Nuvio
 # account's addon list) before ever touching a third party. This is only a

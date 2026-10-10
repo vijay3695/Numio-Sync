@@ -210,6 +210,29 @@
       Signed in &mdash; <button id="generate" class="btn-primary" style="margin-left:8px">Generate add-on URL</button>
     </div>
 
+    <!-- ============ STEP 1b: link Stremio (optional but recommended) ============ -->
+    <div id="stremioLink" style="display:none;margin-top:18px;border-top:1px solid var(--border);padding-top:16px">
+      <h2 style="font-size:15px;margin:0 0 4px">Link your Stremio account <span style="color:var(--text-dim);font-weight:400">(optional)</span></h2>
+      <p class="sub">Makes what you watch in <b>Nuvio</b> resume at the right spot in <b>Stremio</b>.
+         Without this, Stremio can show your Nuvio progress but always starts from zero.
+         Same rules: exchanged once, never stored, nothing logged.</p>
+      <div class="row">
+        <div>
+          <label for="stremioEmail">Stremio email</label>
+          <input id="stremioEmail" type="email" placeholder="you@example.com" autocomplete="username" spellcheck="false" />
+        </div>
+        <div>
+          <label for="stremioPassword">Stremio password</label>
+          <input id="stremioPassword" type="password" placeholder="your Stremio password" autocomplete="current-password" />
+        </div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button id="stremioSignin" class="btn-ghost">Link Stremio</button>
+        <button id="skipStremio" class="btn-ghost" type="button">Skip &mdash; Nuvio only</button>
+      </div>
+      <div id="stremioStatus" class="status"></div>
+    </div>
+
     <details style="margin-top:14px;background:none;border:none;padding:0">
       <summary style="font-size:13px;color:var(--text-dim)">Advanced: paste an access token instead</summary>
       <div style="margin-top:10px">
@@ -255,6 +278,9 @@
       <li><b>Watch something in Stremio.</b> Start, pause, seek and close events are
         pushed to your Nuvio account within seconds. Open Nuvio&rsquo;s
         <i>Continue Watching</i> &mdash; the movie is there with its position.</li>
+      <li><b>Watch something in Nuvio</b> (or on another device) &rarr; open Stremio&rsquo;s
+        <i>Continue Watching (Nuvio)</i> row &rarr; it <b>resumes at the same position</b>
+        (requires the linked Stremio account above).</li>
       <li><b>Watch something in Nuvio</b> (if your client also emits player events),
         then open Stremio&rsquo;s <i>Continue Watching (Nuvio)</i> row to resume.</li>
     </ol>
@@ -293,6 +319,10 @@
       <tr>
         <td><code>/catalog/movie/nuviowatched.json</code></td>
         <td>Pulls your Nuvio watch history and renders the <i>Watched (Nuvio)</i> row &mdash; the same list as the <i>Watched</i> tab on your Nuvio account dashboard.</td>
+      </tr>
+      <tr>
+        <td>Stremio account write-back <span style="opacity:.6">(when linked)</span></td>
+        <td>Writes <code>libraryItem.state.timeOffset</code> into your Stremio account via Stremio's own API &mdash; the only way Nuvio progress can actually <b>resume</b> in Stremio. Skipping the link leaves this as a display-only row.</td>
       </tr>
     </table>
 
@@ -352,11 +382,13 @@
   var LS_KEY = "nuvio-sync-prefs";
 
   /**
-   * The Nuvio access token, held in memory only.
-   * Deliberately NOT written to localStorage: it is a bearer credential with
-   * a ~1 hour lifetime, so persisting it buys nothing and costs exposure.
+   * Credentials, held in memory only.
+   * Deliberately NOT written to localStorage: they are bearer credentials
+   * (the Nuvio token lives ~1 hour), so persisting them buys nothing and
+   * costs exposure.
    */
-  var accessToken = null;
+  var accessToken = null;      // Nuvio access token
+  var stremioKey = null;       // Stremio authKey (optional - enables resume)
 
   // ---- Persistence (this browser only, for convenience) --------------------
   function loadPrefs() {
@@ -391,9 +423,11 @@
    * Worker decodes each path segment before using it.
    */
   function buildAddonUrl(token) {
-    var worker = WORKER_URL;
     var profile = parseInt(profileInput.value, 10) || 1;
-    return worker + "/t/" + encodeURIComponent(token) + "@" + profile + "/manifest.json";
+    var url = WORKER_URL + "/t/" + encodeURIComponent(token) + "@" + profile;
+    // /s/<stremioAuthKey> enables the Nuvio -> Stremio resume write-back.
+    if (stremioKey) url += "/s/" + encodeURIComponent(stremioKey);
+    return url + "/manifest.json";
   }
 
   // ---- Status helper ---------------------------------------------------------
@@ -446,6 +480,7 @@
             ". Token is valid for " + Math.round((r.body.expires_in || 3600) / 60) + " minutes; " +
             "if syncing stops later, sign in again to refresh it.", "ok");
           signedInAs.style.display = "block";
+          document.getElementById("stremioLink").style.display = "block";
         } else {
           setStatus(signinStatus, "Sign-in failed" + (r.body && r.body.error ? ": " + escapeHtml(r.body.error) : ""), "err");
         }
@@ -454,6 +489,52 @@
         setStatus(signinStatus, "Could not reach the Worker. Check the URL.", "err");
       })
       .then(function () { signinBtn.disabled = false; });
+  }
+
+  /**
+   * Link the user's Stremio account via the Worker's /stremio-login endpoint:
+   *   POST <worker>/stremio-login  { email, password }
+   *     -> Worker calls api.strem.io/api/login, validates with getUser
+   *     -> returns ONLY { authKey, user }
+   *
+   * The authKey is what lets the Worker write resume points into the user's
+   * Stremio library (libraryItem.state.timeOffset). Password is cleared from
+   * the DOM the moment it is sent; neither credential is stored.
+   */
+  function stremioSignIn() {
+    var email = document.getElementById("stremioEmail").value.trim();
+    var password = document.getElementById("stremioPassword").value;
+    var statusEl = document.getElementById("stremioStatus");
+    if (!email || !password) {
+      setStatus(statusEl, "Enter your Stremio email and password.", "err");
+      return;
+    }
+    setStatus(statusEl, "Linking Stremio&hellip;", "");
+    document.getElementById("stremioPassword").value = "";
+
+    fetch(WORKER_URL + "/stremio-login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, password: password })
+    })
+      .then(function (res) {
+        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+      })
+      .then(function (r) {
+        if (r.ok && r.body && r.body.ok && r.body.authKey) {
+          stremioKey = r.body.authKey;
+          setStatus(statusEl,
+            "Stremio linked" + (r.body.user && r.body.user.email ? " as " + escapeHtml(r.body.user.email) : "") +
+            " &mdash; Nuvio progress will resume inside Stremio.", "ok");
+          document.getElementById("stremioSignin").style.display = "none";
+          document.getElementById("skipStremio").style.display = "none";
+        } else {
+          setStatus(statusEl, "Stremio link failed" + (r.body && r.body.error ? ": " + escapeHtml(r.body.error) : ""), "err");
+        }
+      })
+      .catch(function () {
+        setStatus(statusEl, "Could not reach the Worker.", "err");
+      });
   }
 
   function escapeHtml(s) {
@@ -469,6 +550,7 @@
     accessToken = t;
     setStatus(signinStatus, "Using the pasted token.", "ok");
     signedInAs.style.display = "block";
+    document.getElementById("stremioLink").style.display = "block";
   }
 
   // ---- QR code (optional enhancement) ---------------------------------------
@@ -520,6 +602,14 @@
     }
   });
   generateBtn.addEventListener("click", generate);
+  document.getElementById("stremioSignin").addEventListener("click", stremioSignIn);
+  document.getElementById("stremioPassword").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") stremioSignIn();
+  });
+  document.getElementById("skipStremio").addEventListener("click", function () {
+    document.getElementById("stremioLink").style.display = "none";
+    setStatus(document.getElementById("stremioStatus"), "", "");
+  });
 
   loadPrefs();
 })();

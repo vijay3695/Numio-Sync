@@ -74,6 +74,22 @@ const NUVIO_PUBLISHABLE_KEY_DEFAULT = 'sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xU
 const NUVIO_BASE_DEFAULT = 'https://api.nuvio.tv';
 
 /**
+ * Stremio's account API (NOT the addon protocol - this is the same API the
+ * Stremio apps themselves use). It is the only way to write a resume point
+ * into a user's Stremio account: library items carry the position in
+ * `state.timeOffset`, which the player reads to resume playback.
+ */
+const STREMIO_API_DEFAULT = 'https://api.strem.io/api';
+
+/**
+ * Library item shape used when writing progress into Stremio.
+ * `temp: true` keeps the item out of the user's library while still storing
+ * the resume point (mirrors what Stremio itself does for played-but-not-added
+ * titles). Set STREMIO_PROGRESS_TEMP=false to also pin items into the library.
+ */
+const STREMIO_PROGRESS_TEMP_DEFAULT = true;
+
+/**
  * Metadata providers, tried in order until one answers.
  *
  * Cinemeta is the default Stremio metadata source, but it is a single third
@@ -207,6 +223,8 @@ function getConfig(env) {
     // metadata fallback when all Cinemeta mirrors are down.
     tmdbKey: env.NUVIO_TMDB_KEY || env.TMDB_API_KEY || null,
     tmdbBase: (env.TMDB_API_BASE || TMDB_API_DEFAULT).replace(/\/+$/, ''),
+    stremioApi: (env.STREMIO_API || STREMIO_API_DEFAULT).replace(/\/+$/, ''),
+    stremioTempItems: (env.STREMIO_PROGRESS_TEMP || String(STREMIO_PROGRESS_TEMP_DEFAULT)) !== 'false',
     // Optional: pin the /login endpoint to your GitHub Pages origin so it
     // cannot be used as a generic Nuvio credential-checking oracle.
     allowedOrigin: (env.ALLOWED_ORIGIN || '').replace(/\/+$/, '') || null,
@@ -357,6 +375,61 @@ function loginErrorMessage(err) {
 }
 
 /**
+ * POST /stremio-login - links the user's Stremio account.
+ *
+ * Body: { email, password }
+ * Response: { ok, authKey, user }
+ *
+ * Same privacy contract as /login: the password is exchanged once against
+ * api.strem.io/api/login and discarded; only the authKey is returned; nothing
+ * is stored or logged. The authKey is embedded in the addon URL so the Worker
+ * can write resume points into the user's Stremio library.
+ */
+async function handleStremioLogin(request, cfg) {
+  // Optional origin pinning (same as /login).
+  const allowed = cfg.allowedOrigin;
+  if (allowed) {
+    const origin = request.headers.get('Origin') || '';
+    if (origin !== allowed) {
+      return json({ ok: false, error: 'origin_not_allowed' }, 403);
+    }
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: 'invalid_body' }, 400);
+  }
+
+  const email = String(body.email || '').trim();
+  const password = String(body.password || '');
+  if (!email || !password) {
+    return json({ ok: false, error: 'email_and_password_required' }, 400);
+  }
+
+  let authKey;
+  let user = null;
+  try {
+    authKey = await stremioLogin(cfg, email, password);
+    // Confirm the key works before handing it back.
+    user = await stremioGetUser(cfg, authKey);
+  } catch (err) {
+    const bad = err.status === 400 || err.status === 401;
+    return json({
+      ok: false,
+      error: bad ? 'Invalid Stremio email or password' : (err.message || 'Stremio sign-in failed'),
+    }, bad ? 400 : 502);
+  }
+
+  return json({
+    ok: true,
+    authKey,
+    user: user && user._id ? { id: user._id, email: user.email } : null,
+  });
+}
+
+/**
  * POST /login - the GitHub Pages sign-in form's endpoint.
  *
  * Body: { email, password }
@@ -465,6 +538,219 @@ function buildProgressEntry(type, videoId, currentTimeMs, durationMs) {
   return base;
 }
 
+
+// ---------------------------------------------------------------------------
+// STREMIO ACCOUNT API (library write-back - makes Nuvio progress resumable
+// inside Stremio, which the addon protocol alone cannot do)
+// ---------------------------------------------------------------------------
+
+/**
+ * Call a Stremio account API method. Envelope: { result, error } where
+ * result is null on some successes. Errors carry { code, message }.
+ */
+async function stremioApi(cfg, method, body) {
+  const res = await fetch(`${cfg.stremioApi}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'stremio-nuvio-sync/1.0' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  const data = safeJsonParse(text);
+
+  if (!res.ok) {
+    const msg = (data && data.error && (data.error.message || data.error.msg))
+      || (data && data.message) || text.slice(0, 200);
+    const err = new Error(`Stremio ${method} failed (${res.status}): ${msg}`);
+    err.status = res.status;
+    throw err;
+  }
+  if (data && data.error && Object.keys(data.error).length) {
+    const msg = data.error.message || data.error.msg || 'unknown error';
+    const err = new Error(`Stremio ${method}: ${msg}`);
+    err.status = 400;
+    throw err;
+  }
+  return data ? data.result : null;
+}
+
+/**
+ * Stremio login: POST /api/login
+ *   { type:"Auth", type:"Login", email, password, facebook:false }
+ *   -> { result: { authKey, user } }
+ *
+ * Powers the "Link Stremio account" step on the page. The authKey is returned
+ * to the browser (memory only) and embedded in the addon URL; the password is
+ * discarded immediately and nothing is stored.
+ */
+async function stremioLogin(cfg, email, password) {
+  const result = await stremioApi(cfg, 'login', {
+    type: 'Auth',
+    type: 'Login',
+    email,
+    password,
+    facebook: false,
+  });
+  const authKey = result && (result.authKey || result.key);
+  if (!authKey) {
+    const err = new Error('Stremio login did not return an authKey');
+    err.status = 502;
+    throw err;
+  }
+  return authKey;
+}
+
+/** Validate an authKey by fetching the user (also used by /stremio-login). */
+async function stremioGetUser(cfg, authKey) {
+  return stremioApi(cfg, 'getUser', { type: 'GetUser', authKey });
+}
+
+/** Read library items: POST /api/datastoreGet { authKey, collection, ids, all }. */
+async function stremioDatastoreGet(cfg, authKey, ids) {
+  return stremioApi(cfg, 'datastoreGet', {
+    authKey,
+    collection: 'libraryItem',
+    ids: ids || [],
+    all: ids ? false : true,
+  });
+}
+
+/** Write library items: POST /api/datastorePut { authKey, collection, changes }. */
+async function stremioDatastorePut(cfg, authKey, changes) {
+  return stremioApi(cfg, 'datastorePut', {
+    authKey,
+    collection: 'libraryItem',
+    changes,
+  });
+}
+
+/** ISO timestamp for Stremio's *_ctime/_mtime/lastWatched fields. */
+function isoNow(offsetMs) {
+  return new Date(Date.now() + (offsetMs || 0)).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/**
+ * Build a Stremio library item carrying a resume position.
+ *
+ * The important part is `state`:
+ *   timeOffset  - current playback position in MS (what the player resumes from)
+ *   duration    - total runtime in MS
+ *   video_id    - the exact video for series ("tt1:2:3"); the movie id for movies
+ *   lastWatched - when it was last watched (used by Stremio for ordering)
+ *
+ * temp/removed: temp items hold progress without pinning the title into the
+ * user's library; flip STREMIO_PROGRESS_TEMP=false for library-pinned items.
+ */
+function buildStremioLibraryItem(row, cfg, meta) {
+  const type = row.content_type === 'series' ? 'series' : 'movie';
+  const position = toInt(row.position, 0);
+  const duration = toInt(row.duration, 0);
+  const videoId = row.video_id || row.content_id;
+  const name = (meta && meta.name) || row.content_id;
+  const poster = (meta && meta.poster) || undefined;
+  const now = isoNow();
+
+  return {
+    _id: row.content_id,
+    name,
+    type,
+    poster: poster || null,
+    posterShape: 'poster',
+    removed: false,
+    temp: cfg.stremioTempItems,
+    _ctime: now,
+    _mtime: now,
+    state: {
+      lastWatched: isoNow(),
+      timeWatched: position,
+      timeOffset: position,
+      overallTimeWatched: position,
+      timesWatched: 1,
+      flaggedWatched: 0,
+      duration,
+      video_id: type === 'series' ? videoId : videoId,
+      watched: null,
+      noNotif: false,
+    },
+    behaviorHints: {
+      defaultVideoId: type === 'series' ? videoId : null,
+      featuredVideoId: null,
+      hasScheduledVideos: false,
+    },
+  };
+}
+
+/**
+ * Is this Nuvio progress row newer than what Stremio already has?
+ * Prevents redundant writes (each datastorePut is a request against the
+ * free-tier budget, and pointless writes would churn the user's account).
+ */
+function isNewerThanStremio(row, existing) {
+  if (!existing || !existing.state) return true;
+  const stremioOffset = toInt(existing.state.timeOffset, 0);
+  const stremioLast = existing.state.lastWatched ? Date.parse(existing.state.lastWatched) : 0;
+  const nuvioLast = toInt(row.last_watched, 0);
+  // Same position already stored -> nothing to do.
+  if (stremioOffset === toInt(row.position, 0) && stremioLast >= nuvioLast) return false;
+  // No timestamps to compare -> write if the position differs.
+  if (!nuvioLast && !stremioLast) return stremioOffset !== toInt(row.position, 0);
+  return nuvioLast > stremioLast;
+}
+
+/**
+ * Push a batch of Nuvio progress rows into the user's Stremio account so
+ * Stremio's own Continue Watching resumes at the right place.
+ *
+ * Writes at most STREMIO_WRITE_BATCH items per call; without storage there
+ * is no durable queue, so the remainder are simply picked up on the next
+ * catalog request (they are still newer than Stremio's copy).
+ */
+const STREMIO_WRITE_BATCH = 10;
+
+async function syncProgressToStremio(cfg, stremioKey, rows) {
+  if (!stremioKey || !Array.isArray(rows) || !rows.length) return { written: 0 };
+
+  // Only rows that actually carry a resumable position.
+  const candidates = rows
+    .filter((r) => r.content_id && toInt(r.position, 0) > 0 && toInt(r.duration, 0) > 0)
+    .slice(0, STREMIO_WRITE_BATCH);
+  if (!candidates.length) return { written: 0 };
+
+  let written = 0;
+  try {
+    const existing = await stremioDatastoreGet(cfg, stremioKey, candidates.map((r) => r.content_id));
+    const byId = new Map();
+    if (Array.isArray(existing)) {
+      for (const item of existing) if (item && item._id) byId.set(item._id, item);
+    } else if (existing && typeof existing === 'object') {
+      // Some responses are keyed by id.
+      for (const [id, item] of Object.entries(existing)) if (item && item._id) byId.set(item._id, item);
+    }
+
+    for (const row of candidates) {
+      if (!isNewerThanStremio(row, byId.get(row.content_id))) continue;
+      try {
+        const meta = await fetchMeta(cfg, row.content_type === 'series' ? 'series' : 'movie', row.content_id, null, null);
+        await stremioDatastorePut(cfg, stremioKey, [buildStremioLibraryItem(row, cfg, meta)]);
+        written += 1;
+        console.log(`[stremio] wrote resume point for ${row.content_id} @ ${toInt(row.position, 0)}ms`);
+      } catch (err) {
+        console.error(`[stremio] write failed for ${row.content_id}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[stremio] datastoreGet failed: ${err.message}`);
+  }
+  return { written };
+}
+
+/**
+ * Write ONE progress row into Stremio (used by the real-time player-event
+ * path when Nuvio reports playback).
+ */
+async function pushProgressToStremio(cfg, stremioKey, row) {
+  return syncProgressToStremio(cfg, stremioKey, [row]);
+}
+
 // ---------------------------------------------------------------------------
 // EVENT HANDLERS (the actual gap-fillers)
 // ---------------------------------------------------------------------------
@@ -477,7 +763,7 @@ function buildProgressEntry(type, videoId, currentTimeMs, durationMs) {
  * failure here would break the user's playback. Everything is caught and
  * logged; the response is always 200 JSON.
  */
-async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profileId) {
+async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profileId, stremioKey) {
   // ---- 1. Parse the protocol's query-style parameters out of the path ----
   const args = parseExtraArgs(extraSegment);
   const action = (args.action || '').toLowerCase();
@@ -512,7 +798,7 @@ async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profil
   // ---- 3. Build the Nuvio entry from Stremio ids ----
   const entry = buildProgressEntry(type, videoId, currentTime, duration);
 
-  // ---- 4. Fire it at Nuvio immediately ----
+  // ---- 4a. Fire it at Nuvio immediately ----
   try {
     await pushProgress(cfg, token, profileId, entry);
     const pct = Math.round((currentTime / duration) * 100);
@@ -520,6 +806,19 @@ async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profil
   } catch (err) {
     // Never break playback because of a sync failure.
     console.error(`[player] push failed: ${err.message}`);
+  }
+
+  // ---- 4b. Mirror it into the user's Stremio account, if linked ----
+  // This is the direction the addon protocol cannot do on its own: Stremio's
+  // own Continue Watching reads `libraryItem.state.timeOffset`, writable only
+  // through the Stremio account API. Without a linked Stremio key this is a
+  // no-op and the Nuvio -> Stremio direction is display-only.
+  if (stremioKey) {
+    try {
+      await pushProgressToStremio(cfg, stremioKey, entry);
+    } catch (err) {
+      console.error(`[player] stremio write-back failed: ${err.message}`);
+    }
   }
 
   // Note: Nuvio auto-upserts a watched-history entry when
@@ -597,7 +896,7 @@ function handleStreamRequest(type, id) {
  * account data, render it as a Stremio row) - except the source is the
  * user's own Nuvio account.
  */
-async function handleCatalog(type, catalogId, cfg, token, profileId) {
+async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey) {
   // Ignore catalogs we do not declare.
   if (catalogId !== 'nuviocw' && catalogId !== 'nuviowatched') return json({ metas: [] });
 
@@ -643,6 +942,17 @@ async function handleCatalog(type, catalogId, cfg, token, profileId) {
     }
 
     metas.push(base);
+  }
+
+  // Nuvio -> Stremio resume: mirror the freshly pulled progress into the
+  // user's Stremio account (if linked) so Stremio's own Continue Watching
+  // resumes at the right position. Best-effort: failures never fail the row.
+  if (stremioKey && catalogId === 'nuviocw') {
+    try {
+      await syncProgressToStremio(cfg, stremioKey, rows);
+    } catch (err) {
+      console.error(`[catalog] stremio write-back failed: ${err.message}`);
+    }
   }
 
   return json({ metas: metas.slice(0, CATALOG_LIMIT) });
@@ -944,12 +1254,28 @@ export default {
       return handleLogin(request, cfg);
     }
 
+    // Stremio account link (produces the authKey for library write-back).
+    if (bare === 'stremio-login' || bare.endsWith('/stremio-login')) {
+      if (request.method !== 'POST') {
+        return json({ error: 'method_not_allowed', hint: 'POST { email, password }' }, 405);
+      }
+      return handleStremioLogin(request, cfg);
+    }
+
+    // ---- Frontend (fix #5: no separate host - the Worker serves the page) ----
+    if (url.pathname === '/' || url.pathname === '/index.html') {
+      return new Response(INDEX_HTML, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS },
+      });
+    }
+
     try {
       const segments = url.pathname.split('/').filter(Boolean).map(safeDecode);
 
       // ---- Resolve optional /t/<token>@<profile> prefix ----------------
       let idx = 0;
       let token = null;
+      let stremioKey = null;
       let profileId = cfg.defaultProfileId;
 
       if (segments[0] === 't' && segments[1]) {
@@ -959,10 +1285,23 @@ export default {
           profileId = parsed.profileId;
         }
         idx = 2;
+
+        // Optional /s/<stremioAuthKey> - enables writing resume points back
+        // into the user's Stremio account (Nuvio -> Stremio resume).
+        if (segments[2] === 's' && segments[3]) {
+          stremioKey = segments[3];
+          idx = 4;
+        }
+      } else if (segments[0] === 's' && segments[1]) {
+        // Stremio-only install (no Nuvio token): still usable for the
+        // catalog-less case, though sync needs the Nuvio token.
+        stremioKey = segments[1];
+        idx = 2;
       }
 
-      // Fallback: token may arrive as ?nuvioToken= on the manifest URL.
+      // Fallback: tokens may arrive as query params on the manifest URL.
       if (!token) token = url.searchParams.get('nuvioToken');
+      if (!stremioKey) stremioKey = url.searchParams.get('stremioKey');
 
       const rest = segments.slice(idx);
       const head = rest[0];
@@ -1006,7 +1345,7 @@ export default {
       if (head === 'catalog' && rest.length >= 3) {
         const type = rest[1];
         const catalogId = rest[2].replace(/\.json$/i, '');
-        return await handleCatalog(type, catalogId, cfg, token, profileId);
+        return await handleCatalog(type, catalogId, cfg, token, profileId, stremioKey);
       }
 
       if (head === 'stream' && rest.length >= 3) {
@@ -1020,7 +1359,7 @@ export default {
         const videoId = rest[2];
         // rest[3] carries action=..&currentTime=..&duration=.. (with .json)
         const extra = rest[3] || '';
-        return await handlePlayerEvent(type, videoId, extra, cfg, token, profileId);
+        return await handlePlayerEvent(type, videoId, extra, cfg, token, profileId, stremioKey);
       }
 
       if (head === 'library' && rest.length >= 3) {
@@ -1103,3 +1442,639 @@ function buildManifest() {
     behaviorHints: { adult: false, p2p: false },
   };
 }
+/**
+ * ============================================================================
+ *  FRONTEND - the single-page UI, inlined into the Worker.
+ * ============================================================================
+ *  Fix #5: this used to be hosted on GitHub Pages. It now ships inside the
+ *  Worker itself, so there is exactly ONE deploy and ONE host - the page at
+ *  https://<worker>/ and the addon at https://<worker>/t/<token>/manifest.json
+ *  share an origin (no CORS at all for the sign-in calls).
+ *
+ *  If you edit this, edit index.html and regenerate the block below (it is a
+ *  verbatim copy with ` and ${ escaped for the template literal).
+ *
+ *  Trade-off: page loads are dynamic requests against the 100k/day free
+ *  budget. Static assets (Workers Assets) are free but need the wrangler CLI;
+ *  inline is what keeps the dashboard-paste deploy working.
+ * ============================================================================
+ */
+const INDEX_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stremio &harr; Nuvio Live Sync</title>
+<meta name="description" content="Free, stateless addon that bridges live playback position between Stremio and Nuvio." />
+
+<!--
+  ============================================================================
+  Stremio <-> Nuvio Live Sync  ·  GitHub Pages frontend (single file)
+  ============================================================================
+  This page does three things and nothing else:
+
+    1. collects the user's Nuvio access token (kept in this browser only,
+       optionally in localStorage for convenience - NEVER transmitted
+       anywhere except inside the addon URL the user installs themselves),
+    2. builds the addon manifest URL of the form
+           https://<worker>/t/<nuvioToken>@<profile>/manifest.json
+       and shows install links + a QR code for TV devices,
+    3. verifies the token against the Worker's /health endpoint, which
+       calls Nuvio's sync_pull_profiles.
+
+  It performs no sync itself. All syncing happens in the Cloudflare Worker
+  (worker.js) that the generated URL points at - this page is a pure
+  static site with zero backend.
+  ============================================================================
+-->
+
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --bg-card: #12121a;
+    --bg-card-2: #1a1a26;
+    --border: #262636;
+    --text: #e8e8f0;
+    --text-dim: #9a9ab0;
+    --accent: #8b5cf6;          /* Stremio-ish purple */
+    --accent-2: #6366f1;
+    --ok: #34d399;
+    --err: #f87171;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+  }
+
+  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
+
+  header { text-align: center; margin-bottom: 36px; }
+  header h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.02em; }
+  header h1 .grad {
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header p { color: var(--text-dim); margin: 0; font-size: 15px; }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 22px;
+    margin-bottom: 22px;
+  }
+  .card h2 {
+    margin: 0 0 4px; font-size: 17px; display: flex; align-items: center; gap: 10px;
+  }
+  .card h2 .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    font-size: 13px; font-weight: 700; color: #fff; flex: none;
+  }
+  .card .sub { color: var(--text-dim); font-size: 13.5px; margin: 0 0 16px; }
+
+  label { display: block; font-size: 13px; color: var(--text-dim); margin: 14px 0 6px; }
+  input[type="text"], input[type="number"] {
+    width: 100%; padding: 11px 13px; border-radius: 9px;
+    border: 1px solid var(--border); background: var(--bg-card-2);
+    color: var(--text); font-size: 14px; font-family: var(--mono);
+    outline: none; transition: border-color .15s;
+  }
+  input:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 220px; }
+
+  button {
+    cursor: pointer; border: none; border-radius: 9px; font-size: 14px;
+    font-weight: 600; padding: 11px 18px; transition: filter .15s, transform .05s;
+  }
+  button:active { transform: translateY(1px); }
+  .btn-primary {
+    background: linear-gradient(90deg, var(--accent), var(--accent-2)); color: #fff;
+  }
+  .btn-primary:hover { filter: brightness(1.12); }
+  .btn-ghost {
+    background: var(--bg-card-2); color: var(--text); border: 1px solid var(--border);
+  }
+  .btn-ghost:hover { border-color: var(--accent); }
+  .btn-ghost:disabled, .btn-primary:disabled { opacity: .5; cursor: default; }
+
+  .urlbox {
+    margin-top: 16px; display: none;
+  }
+  .urlbox.show { display: block; }
+  .urlbox .field { display: flex; gap: 8px; }
+  .urlbox input { flex: 1; }
+  .hint { font-size: 12.5px; color: var(--text-dim); margin-top: 8px; }
+  .hint.warn { color: #fbbf24; }
+
+  .status { margin-top: 10px; font-size: 13.5px; display: none; }
+  .status.show { display: block; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--err); }
+
+  .steps { margin: 0; padding-left: 0; list-style: none; counter-reset: step; }
+  .steps li {
+    counter-increment: step; position: relative; padding-left: 34px;
+    margin-bottom: 14px; font-size: 14px;
+  }
+  .steps li::before {
+    content: counter(step); position: absolute; left: 0; top: 1px;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: var(--bg-card-2); border: 1px solid var(--border);
+    color: var(--accent); font-size: 12px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .steps b { color: var(--text); }
+  .steps code, .inline-code {
+    background: var(--bg-card-2); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 6px; font-size: 12.5px; font-family: var(--mono);
+    color: var(--accent);
+  }
+
+  .qr-area { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+  #qrcode {
+    background: #fff; padding: 10px; border-radius: 10px; display: none;
+  }
+  #qrcode.show { display: block; }
+  #qrcode img, #qrcode canvas { display: block; }
+
+  details {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 16px 22px; margin-bottom: 22px;
+  }
+  summary { cursor: pointer; font-weight: 600; font-size: 15px; }
+  details[open] summary { margin-bottom: 12px; }
+  details p, details li { font-size: 13.5px; color: var(--text-dim); }
+  details ul { padding-left: 20px; margin: 8px 0; }
+
+  table.spec { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+  table.spec th, table.spec td {
+    text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  table.spec th { color: var(--text-dim); font-weight: 600; }
+  table.spec td code { font-family: var(--mono); color: var(--accent); font-size: 12px; }
+
+  footer {
+    text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 8px;
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1><span class="grad">Stremio &harr; Nuvio</span> Live Sync</h1>
+    <p>Free &amp; stateless. Sync live playback position and watched-state between
+       Stremio and Nuvio &mdash; one addon URL, installed in both apps.</p>
+  </header>
+
+  <!-- ================= STEP 1: connect ================= -->
+  <section class="card">
+    <h2><span class="num">1</span> Sign in to Nuvio</h2>
+    <p class="sub">The same login you use in the Nuvio app. Your password is sent to
+       this Worker only to exchange it for a Nuvio token &mdash; it is never stored,
+       never logged, and the token stays in your browser.</p>
+
+    <div class="row">
+      <div>
+        <label for="email">Nuvio email</label>
+        <input id="email" type="email" placeholder="you@example.com" autocomplete="username" spellcheck="false" />
+      </div>
+      <div>
+        <label for="password">Password</label>
+        <input id="password" type="password" placeholder="your Nuvio password" autocomplete="current-password" />
+      </div>
+      <div style="flex:0 0 110px">
+        <label for="profile">Profile #</label>
+        <input id="profile" type="number" min="1" max="6" step="1" value="1" />
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <button id="signin" class="btn-primary">Sign in</button>
+      <button id="reset" class="btn-ghost" type="button">Clear saved</button>
+    </div>
+
+    <div id="signinStatus" class="status"></div>
+    <div id="signedInAs" class="status" style="display:none">
+      Signed in &mdash; <button id="generate" class="btn-primary" style="margin-left:8px">Generate add-on URL</button>
+    </div>
+
+    <!-- ============ STEP 1b: link Stremio (optional but recommended) ============ -->
+    <div id="stremioLink" style="display:none;margin-top:18px;border-top:1px solid var(--border);padding-top:16px">
+      <h2 style="font-size:15px;margin:0 0 4px">Link your Stremio account <span style="color:var(--text-dim);font-weight:400">(optional)</span></h2>
+      <p class="sub">Makes what you watch in <b>Nuvio</b> resume at the right spot in <b>Stremio</b>.
+         Without this, Stremio can show your Nuvio progress but always starts from zero.
+         Same rules: exchanged once, never stored, nothing logged.</p>
+      <div class="row">
+        <div>
+          <label for="stremioEmail">Stremio email</label>
+          <input id="stremioEmail" type="email" placeholder="you@example.com" autocomplete="username" spellcheck="false" />
+        </div>
+        <div>
+          <label for="stremioPassword">Stremio password</label>
+          <input id="stremioPassword" type="password" placeholder="your Stremio password" autocomplete="current-password" />
+        </div>
+      </div>
+      <div class="row" style="margin-top:14px">
+        <button id="stremioSignin" class="btn-ghost">Link Stremio</button>
+        <button id="skipStremio" class="btn-ghost" type="button">Skip &mdash; Nuvio only</button>
+      </div>
+      <div id="stremioStatus" class="status"></div>
+    </div>
+
+    <details style="margin-top:14px;background:none;border:none;padding:0">
+      <summary style="font-size:13px;color:var(--text-dim)">Advanced: paste an access token instead</summary>
+      <div style="margin-top:10px">
+        <input id="token" type="text" placeholder="paste a Nuvio access token" autocomplete="off" spellcheck="false" />
+        <button id="useToken" class="btn-ghost" style="margin-top:8px">Use this token</button>
+      </div>
+    </details>
+
+    <div id="urlbox" class="urlbox">
+      <label>Your personal add-on URL &mdash; install this in both Stremio and Nuvio</label>
+      <div class="field">
+        <input id="addonUrl" type="text" readonly />
+        <button id="copy" class="btn-ghost">Copy</button>
+      </div>
+      <p class="hint">
+        The token lives in the URL path &mdash; that is the whole &ldquo;login&rdquo; system.
+        Treat this URL like a password: it grants access to your Nuvio progress.
+      </p>
+    </div>
+  </section>
+
+  <!-- ================= STEP 2: install ================= -->
+  <section class="card" id="installCard" style="display:none">
+    <h2><span class="num">2</span> Install in your apps</h2>
+    <p class="sub">The same URL works in Stremio and Nuvio &mdash; both speak the Stremio addon protocol.</p>
+
+    <div class="qr-area">
+      <div id="qrcode" title="Scan with Nuvio TV &rarr; Manage from phone"></div>
+      <div>
+        <p style="margin:0 0 6px;font-size:14px"><b>Nuvio TV:</b> Addons &rarr; <i>Manage from phone</i> &rarr; scan this QR code</p>
+        <p style="margin:0;font-size:13px;color:var(--text-dim)">Phones can also open this page and copy the URL.</p>
+      </div>
+    </div>
+
+    <ol class="steps" style="margin-top:20px">
+      <li><b>Stremio (Desktop / Web / Android / TV):</b>
+        open <code>Addons</code> &rarr; paste the URL above &rarr; Install.
+        You should see two new rows: <i>Continue Watching (Nuvio)</i> and
+        <i>Watched (Nuvio)</i>.</li>
+      <li><b>Nuvio (Android / TV / Desktop):</b>
+        <code>Settings &rarr; Content &amp; Discovery &rarr; Addons</code> &rarr;
+        paste the same URL into <i>Add Addon</i> &rarr; Install.</li>
+      <li><b>Watch something in Stremio.</b> Start, pause, seek and close events are
+        pushed to your Nuvio account within seconds. Open Nuvio&rsquo;s
+        <i>Continue Watching</i> &mdash; the movie is there with its position.</li>
+      <li><b>Watch something in Nuvio</b> (or on another device) &rarr; open Stremio&rsquo;s
+        <i>Continue Watching (Nuvio)</i> row &rarr; it <b>resumes at the same position</b>
+        (requires the linked Stremio account above).</li>
+      <li><b>Watch something in Nuvio</b> (if your client also emits player events),
+        then open Stremio&rsquo;s <i>Continue Watching (Nuvio)</i> row to resume.</li>
+    </ol>
+  </section>
+
+  <!-- ================= how it works ================= -->
+  <details>
+    <summary>How it works (and how to verify it is syncing)</summary>
+
+    <p>The addon is a stateless Cloudflare Worker. It declares the Stremio protocol&rsquo;s
+    <b>event resources</b>, which is the part most addons never use: instead of serving
+    content, the addon <i>receives</i> your activity.</p>
+
+    <table class="spec">
+      <tr><th>Stremio sends</th><th>Worker does</th></tr>
+      <tr>
+        <td><code>/player/movie/tt0137523/action=start&amp;currentTime=0&amp;duration=7200000.json</code></td>
+        <td>Parses <code>action</code>, <code>currentTime</code> (ms), <code>duration</code> (ms) from the path, then POSTs to <code>sync_push_watch_progress</code>.</td>
+      </tr>
+      <tr>
+        <td><code>.../action=pause&amp;currentTime=1830000&amp;duration=7200000.json</code></td>
+        <td>Pushes position 1&thinsp;830&thinsp;000&nbsp;ms (30:30) to Nuvio &mdash; that is your resume point.</td>
+      </tr>
+      <tr>
+        <td><code>.../action=stop&amp;currentTime=6900000&amp;duration=7200000.json</code></td>
+        <td>Fires even when the player closes or the app exits abruptly. Pushes the final position; Nuvio auto-marks watched at &ge;90%.</td>
+      </tr>
+      <tr>
+        <td><code>/library/movie/tt0137523/action=watched.json</code></td>
+        <td>Pushes a watched-history item to Nuvio.</td>
+      </tr>
+      <tr>
+        <td><code>/catalog/movie/nuviocw.json</code> (you opening Stremio)</td>
+        <td>Pulls your Nuvio progress and renders the <i>Continue Watching (Nuvio)</i> row.</td>
+      </tr>
+      <tr>
+        <td><code>/catalog/movie/nuviowatched.json</code></td>
+        <td>Pulls your Nuvio watch history and renders the <i>Watched (Nuvio)</i> row &mdash; the same list as the <i>Watched</i> tab on your Nuvio account dashboard.</td>
+      </tr>
+      <tr>
+        <td>Stremio account write-back <span style="opacity:.6">(when linked)</span></td>
+        <td>Writes <code>libraryItem.state.timeOffset</code> into your Stremio account via Stremio's own API &mdash; the only way Nuvio progress can actually <b>resume</b> in Stremio. Skipping the link leaves this as a display-only row.</td>
+      </tr>
+    </table>
+
+    <p style="margin-top:14px"><b>Verify it works:</b> the addon operator can run
+    <code>npx wrangler tail</code> (or open the Worker&rsquo;s Logs in the Cloudflare dashboard)
+    &mdash; every <code>[player]</code> line shows the parsed action, position and duration
+    arriving live during playback.</p>
+
+    <p><b>Note:</b> player events are a recent protocol addition. If your Stremio build does
+    not send them yet, you will see no <code>[player]</code> lines in the logs &mdash; in that
+    case only the catalog row (Nuvio&rarr;Stremio resume) and watched toggles sync.
+    Updating Stremio/Nuvio to the latest version is the fix.</p>
+
+    <p><b>Privacy:</b> no server stores anything. Your token is read from the URL on each
+    request, used for one call to Nuvio&rsquo;s API, and discarded. You can revoke access
+    instantly by regenerating your token or uninstalling the addon in both apps.</p>
+  </details>
+
+  <footer>
+    100% free &amp; open &middot; GitHub Pages + Cloudflare Workers &middot;
+    no database, no accounts, no tracking
+  </footer>
+</div>
+
+<!-- QR code generator (CDN, optional enhancement - page works without it) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- Element handles -----------------------------------------------------
+  var $ = function (id) { return document.getElementById(id); };
+  var emailInput = $("email");
+  var passwordInput = $("password");
+  var profileInput = $("profile");
+  var tokenInput = $("token");
+
+  /**
+   * The deployed Cloudflare Worker. Hardcoded so users never see or type a
+   * backend URL - the page only asks for their Nuvio credentials.
+   * If the Worker is ever redeployed to a new address, change this one line.
+   */
+  var WORKER_URL = "https://numio-sync.vijaykumar-f83.workers.dev";
+  var signinBtn = $("signin");
+  var useTokenBtn = $("useToken");
+  var resetBtn = $("reset");
+  var signinStatus = $("signinStatus");
+  var signedInAs = $("signedInAs");
+  var generateBtn = $("generate");
+  var urlBox = $("urlbox");
+  var addonUrlInput = $("addonUrl");
+  var copyBtn = $("copy");
+  var installCard = $("installCard");
+  var qrHost = $("qrcode");
+
+  var LS_KEY = "nuvio-sync-prefs";
+
+  /**
+   * Credentials, held in memory only.
+   * Deliberately NOT written to localStorage: they are bearer credentials
+   * (the Nuvio token lives ~1 hour), so persisting them buys nothing and
+   * costs exposure.
+   */
+  var accessToken = null;      // Nuvio access token
+  var stremioKey = null;       // Stremio authKey (optional - enables resume)
+
+  // ---- Persistence (this browser only, for convenience) --------------------
+  function loadPrefs() {
+    try {
+      var raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      var prefs = JSON.parse(raw);
+      if (prefs.profile) profileInput.value = prefs.profile;
+    } catch (e) { /* storage unavailable - ignore */ }
+  }
+  function savePrefs() {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        profile: profileInput.value
+      }));
+    } catch (e) { /* storage unavailable - ignore */ }
+  }
+
+  // ---- URL building ---------------------------------------------------------
+  /**
+   * Build the addon manifest URL.
+   *
+   * Shape:  https://<worker>/t/<accessToken>@<profile>/manifest.json
+   *
+   * Why the token is in the PATH and not the query string: Stremio's HTTP
+   * transport derives every subsequent resource request from the directory
+   * the manifest was installed from, so the /t/<token>/ prefix is
+   * automatically re-appended to every player/catalog/library request.
+   * Query strings on the manifest URL are NOT preserved by the client.
+   *
+   * encodeURIComponent keeps tokens with unusual characters URL-safe; the
+   * Worker decodes each path segment before using it.
+   */
+  function buildAddonUrl(token) {
+    var profile = parseInt(profileInput.value, 10) || 1;
+    var url = WORKER_URL + "/t/" + encodeURIComponent(token) + "@" + profile;
+    // /s/<stremioAuthKey> enables the Nuvio -> Stremio resume write-back.
+    if (stremioKey) url += "/s/" + encodeURIComponent(stremioKey);
+    return url + "/manifest.json";
+  }
+
+  // ---- Status helper ---------------------------------------------------------
+  function setStatus(el, msg, kind) {
+    el.innerHTML = msg;
+    el.className = "status show " + (kind || "");
+  }
+
+  // ---- Sign in ---------------------------------------------------------------
+  /**
+   * Exchange the user's Nuvio credentials for an access token via the
+   * Worker's /login endpoint:
+   *
+   *   POST <worker>/login  { email, password }
+   *     -> Worker calls api.nuvio.tv/auth/v1/token?grant_type=password
+   *     -> returns ONLY { access_token, expires_in, profiles }
+   *
+   * The password is used once and discarded by the Worker; nothing is
+   * stored server-side. The returned token is kept in memory (never in
+   * localStorage) and embedded only in the addon URL the user installs.
+   */
+  function signIn() {
+    var worker = WORKER_URL;
+    var email = emailInput.value.trim();
+    var password = passwordInput.value;
+    if (!WORKER_URL) { setStatus(signinStatus, "Worker URL not configured.", "err"); return; }
+    if (!email || !password) { setStatus(signinStatus, "Enter your Nuvio email and password.", "err"); return; }
+
+    savePrefs();
+    signinBtn.disabled = true;
+    setStatus(signinStatus, "Signing in&hellip;", "");
+    passwordInput.value = ""; // never keep the password in the DOM
+
+    fetch(worker + "/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, password: password })
+    })
+      .then(function (res) {
+        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+      })
+      .then(function (r) {
+        if (r.ok && r.body && r.body.ok && r.body.access_token) {
+          accessToken = r.body.access_token;
+          var names = Array.isArray(r.body.profiles) && r.body.profiles.length
+            ? r.body.profiles.map(function (p) { return escapeHtml(p.name || "Profile") + " #" + escapeHtml(p.index); }).join(", ")
+            : null;
+          setStatus(signinStatus,
+            "Signed in" + (names ? " &mdash; profiles: " + names : "") +
+            ". Token is valid for " + Math.round((r.body.expires_in || 3600) / 60) + " minutes; " +
+            "if syncing stops later, sign in again to refresh it.", "ok");
+          signedInAs.style.display = "block";
+          document.getElementById("stremioLink").style.display = "block";
+        } else {
+          setStatus(signinStatus, "Sign-in failed" + (r.body && r.body.error ? ": " + escapeHtml(r.body.error) : ""), "err");
+        }
+      })
+      .catch(function () {
+        setStatus(signinStatus, "Could not reach the Worker. Check the URL.", "err");
+      })
+      .then(function () { signinBtn.disabled = false; });
+  }
+
+  /**
+   * Link the user's Stremio account via the Worker's /stremio-login endpoint:
+   *   POST <worker>/stremio-login  { email, password }
+   *     -> Worker calls api.strem.io/api/login, validates with getUser
+   *     -> returns ONLY { authKey, user }
+   *
+   * The authKey is what lets the Worker write resume points into the user's
+   * Stremio library (libraryItem.state.timeOffset). Password is cleared from
+   * the DOM the moment it is sent; neither credential is stored.
+   */
+  function stremioSignIn() {
+    var email = document.getElementById("stremioEmail").value.trim();
+    var password = document.getElementById("stremioPassword").value;
+    var statusEl = document.getElementById("stremioStatus");
+    if (!email || !password) {
+      setStatus(statusEl, "Enter your Stremio email and password.", "err");
+      return;
+    }
+    setStatus(statusEl, "Linking Stremio&hellip;", "");
+    document.getElementById("stremioPassword").value = "";
+
+    fetch(WORKER_URL + "/stremio-login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, password: password })
+    })
+      .then(function (res) {
+        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+      })
+      .then(function (r) {
+        if (r.ok && r.body && r.body.ok && r.body.authKey) {
+          stremioKey = r.body.authKey;
+          setStatus(statusEl,
+            "Stremio linked" + (r.body.user && r.body.user.email ? " as " + escapeHtml(r.body.user.email) : "") +
+            " &mdash; Nuvio progress will resume inside Stremio.", "ok");
+          document.getElementById("stremioSignin").style.display = "none";
+          document.getElementById("skipStremio").style.display = "none";
+        } else {
+          setStatus(statusEl, "Stremio link failed" + (r.body && r.body.error ? ": " + escapeHtml(r.body.error) : ""), "err");
+        }
+      })
+      .catch(function () {
+        setStatus(statusEl, "Could not reach the Worker.", "err");
+      });
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // ---- Advanced manual-token path --------------------------------------------
+  function useManualToken() {
+    var t = tokenInput.value.trim();
+    if (!t) { setStatus(signinStatus, "Paste a token first.", "err"); return; }
+    accessToken = t;
+    setStatus(signinStatus, "Using the pasted token.", "ok");
+    signedInAs.style.display = "block";
+    document.getElementById("stremioLink").style.display = "block";
+  }
+
+  // ---- QR code (optional enhancement) ---------------------------------------
+  function renderQr(url) {
+    qrHost.innerHTML = "";
+    qrHost.classList.remove("show");
+    if (typeof QRCode === "undefined") return; // CDN blocked - skip quietly
+    try {
+      new QRCode(qrHost, { text: url, width: 168, height: 168, correctLevel: QRCode.CorrectLevel.M });
+      qrHost.classList.add("show");
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---- Generate ---------------------------------------------------------------
+  function generate() {
+    if (!accessToken) {
+      setStatus(signinStatus, "Sign in to Nuvio first.", "err");
+      return;
+    }
+    var url = buildAddonUrl(accessToken);
+    addonUrlInput.value = url;
+    urlBox.classList.add("show");
+    installCard.style.display = "block";
+    renderQr(url);
+  }
+
+  // ---- Wiring -----------------------------------------------------------------
+  signinBtn.addEventListener("click", signIn);
+  // Enter in the password field submits.
+  passwordInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") signIn();
+  });
+  useTokenBtn.addEventListener("click", useManualToken);
+  resetBtn.addEventListener("click", function () {
+    try { localStorage.removeItem(LS_KEY); } catch (e) {}
+    emailInput.value = ""; passwordInput.value = ""; profileInput.value = "1";
+    accessToken = null;
+    signedInAs.style.display = "none";
+    urlBox.classList.remove("show"); installCard.style.display = "none";
+    setStatus(signinStatus, "Saved details cleared.", "");
+  });
+  copyBtn.addEventListener("click", function () {
+    addonUrlInput.select();
+    var done = function () { copyBtn.textContent = "Copied"; setTimeout(function () { copyBtn.textContent = "Copy"; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(addonUrlInput.value).then(done, function () { document.execCommand("copy"); done(); });
+    } else {
+      document.execCommand("copy"); done();
+    }
+  });
+  generateBtn.addEventListener("click", generate);
+  document.getElementById("stremioSignin").addEventListener("click", stremioSignIn);
+  document.getElementById("stremioPassword").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") stremioSignIn();
+  });
+  document.getElementById("skipStremio").addEventListener("click", function () {
+    document.getElementById("stremioLink").style.display = "none";
+    setStatus(document.getElementById("stremioStatus"), "", "");
+  });
+
+  loadPrefs();
+})();
+</script>
+</body>
+</html>
+`;
