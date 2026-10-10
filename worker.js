@@ -330,14 +330,15 @@ async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profil
 
   // ---- 2. Validate before spending an upstream call ----
   // Without a duration Nuvio cannot place the resume point, and the schema
-  // requires it. Without a position (start at 0) there is nothing to sync -
-  // Nuvio would ignore a 0-position write anyway.
+  // requires it. Without a position (playback barely started / was at 0)
+  // there is nothing worth syncing - a 0% Continue Watching row is just noise,
+  // so we skip the write regardless of the action.
   if (duration <= 0) {
     console.log('[player] skip push: missing duration');
     return eventOk();
   }
-  if (currentTime <= 0 && action !== 'stop') {
-    console.log('[player] skip push: playback at position 0 (start from beginning)');
+  if (currentTime <= 0) {
+    console.log('[player] skip push: playback at position 0 (nothing to sync yet)');
     return eventOk();
   }
 
@@ -637,7 +638,6 @@ function buildManifest() {
       'Bridges live playback position and watched-state between Stremio and Nuvio. ' +
       'Stateless, no data stored. Declares the player event resource to receive ' +
       'start/pause/stop with the current playback position.',
-    logo: 'https://raw.githubusercontent.com/Stremio/stremio-addon-sdk/master/docs/img/logo.png',
     types: ['movie', 'series'],
     idPrefixes: ['tt'],
     catalogs: [

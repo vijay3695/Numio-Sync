@@ -395,6 +395,8 @@
     testBtn.disabled = true;
 
     var profile = parseInt(profileInput.value, 10) || 1;
+    // encodeURIComponent keeps tokens with '@', '/', '?' etc. URL-safe - the
+    // Worker decodes each path segment before using it.
     fetch(worker + "/t/" + encodeURIComponent(token) + "@" + profile + "/health")
       .then(function (res) {
         return res.json().then(function (body) { return { ok: res.ok, body: body }; });
