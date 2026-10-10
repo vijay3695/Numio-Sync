@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stremio &harr; Nuvio Live Sync</title>
+<meta name="description" content="Free, stateless addon that bridges live playback position between Stremio and Nuvio." />
+
+<!--
+  ============================================================================
+  Stremio <-> Nuvio Live Sync  ·  GitHub Pages frontend (single file)
+  ============================================================================
+  This page does three things and nothing else:
+
+    1. collects the user's Nuvio access token (kept in this browser only,
+       optionally in localStorage for convenience - NEVER transmitted
+       anywhere except inside the addon URL the user installs themselves),
+    2. builds the addon manifest URL of the form
+           https://<worker>/t/<nuvioToken>@<profile>/manifest.json
+       and shows install links + a QR code for TV devices,
+    3. verifies the token against the Worker's /health endpoint, which
+       calls Nuvio's sync_pull_profiles.
+
+  It performs no sync itself. All syncing happens in the Cloudflare Worker
+  (worker.js) that the generated URL points at - this page is a pure
+  static site with zero backend.
+  ============================================================================
+-->
+
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --bg-card: #12121a;
+    --bg-card-2: #1a1a26;
+    --border: #262636;
+    --text: #e8e8f0;
+    --text-dim: #9a9ab0;
+    --accent: #8b5cf6;          /* Stremio-ish purple */
+    --accent-2: #6366f1;
+    --ok: #34d399;
+    --err: #f87171;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+  }
+
+  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
+
+  header { text-align: center; margin-bottom: 36px; }
+  header h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.02em; }
+  header h1 .grad {
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header p { color: var(--text-dim); margin: 0; font-size: 15px; }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 22px;
+    margin-bottom: 22px;
+  }
+  .card h2 {
+    margin: 0 0 4px; font-size: 17px; display: flex; align-items: center; gap: 10px;
+  }
+  .card h2 .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    font-size: 13px; font-weight: 700; color: #fff; flex: none;
+  }
+  .card .sub { color: var(--text-dim); font-size: 13.5px; margin: 0 0 16px; }
+
+  label { display: block; font-size: 13px; color: var(--text-dim); margin: 14px 0 6px; }
+  input[type="text"], input[type="number"] {
+    width: 100%; padding: 11px 13px; border-radius: 9px;
+    border: 1px solid var(--border); background: var(--bg-card-2);
+    color: var(--text); font-size: 14px; font-family: var(--mono);
+    outline: none; transition: border-color .15s;
+  }
+  input:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 220px; }
+
+  button {
+    cursor: pointer; border: none; border-radius: 9px; font-size: 14px;
+    font-weight: 600; padding: 11px 18px; transition: filter .15s, transform .05s;
+  }
+  button:active { transform: translateY(1px); }
+  .btn-primary {
+    background: linear-gradient(90deg, var(--accent), var(--accent-2)); color: #fff;
+  }
+  .btn-primary:hover { filter: brightness(1.12); }
+  .btn-ghost {
+    background: var(--bg-card-2); color: var(--text); border: 1px solid var(--border);
+  }
+  .btn-ghost:hover { border-color: var(--accent); }
+  .btn-ghost:disabled, .btn-primary:disabled { opacity: .5; cursor: default; }
+
+  .urlbox {
+    margin-top: 16px; display: none;
+  }
+  .urlbox.show { display: block; }
+  .urlbox .field { display: flex; gap: 8px; }
+  .urlbox input { flex: 1; }
+  .hint { font-size: 12.5px; color: var(--text-dim); margin-top: 8px; }
+  .hint.warn { color: #fbbf24; }
+
+  .status { margin-top: 10px; font-size: 13.5px; display: none; }
+  .status.show { display: block; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--err); }
+
+  .steps { margin: 0; padding-left: 0; list-style: none; counter-reset: step; }
+  .steps li {
+    counter-increment: step; position: relative; padding-left: 34px;
+    margin-bottom: 14px; font-size: 14px;
+  }
+  .steps li::before {
+    content: counter(step); position: absolute; left: 0; top: 1px;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: var(--bg-card-2); border: 1px solid var(--border);
+    color: var(--accent); font-size: 12px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .steps b { color: var(--text); }
+  .steps code, .inline-code {
+    background: var(--bg-card-2); border: 1px solid var(--border);
+    border-radius: 5px; padding: 1px 6px; font-size: 12.5px; font-family: var(--mono);
+    color: var(--accent);
+  }
+
+  .qr-area { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+  #qrcode {
+    background: #fff; padding: 10px; border-radius: 10px; display: none;
+  }
+  #qrcode.show { display: block; }
+  #qrcode img, #qrcode canvas { display: block; }
+
+  details {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 16px 22px; margin-bottom: 22px;
+  }
+  summary { cursor: pointer; font-weight: 600; font-size: 15px; }
+  details[open] summary { margin-bottom: 12px; }
+  details p, details li { font-size: 13.5px; color: var(--text-dim); }
+  details ul { padding-left: 20px; margin: 8px 0; }
+
+  table.spec { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+  table.spec th, table.spec td {
+    text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  table.spec th { color: var(--text-dim); font-weight: 600; }
+  table.spec td code { font-family: var(--mono); color: var(--accent); font-size: 12px; }
+
+  footer {
+    text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 8px;
+  }
+  footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1><span class="grad">Stremio &harr; Nuvio</span> Live Sync</h1>
+    <p>Free &amp; stateless. Sync live playback position and watched-state between
+       Stremio and Nuvio &mdash; one addon URL, installed in both apps.</p>
+  </header>
+
+  <!-- ================= STEP 1: connect ================= -->
+  <section class="card">
+    <h2><span class="num">1</span> Connect your Nuvio account</h2>
+    <p class="sub">Your token is used only to talk to Nuvio&rsquo;s API. Nothing is stored on any server.</p>
+
+    <div class="row">
+      <div>
+        <label for="token">Nuvio Access Token</label>
+        <input id="token" type="text" placeholder="paste your Nuvio access token" autocomplete="off" spellcheck="false" />
+      </div>
+      <div>
+        <label for="profile">Nuvio profile # (1&ndash;6)</label>
+        <input id="profile" type="number" min="1" max="6" step="1" value="1" />
+      </div>
+    </div>
+
+    <label for="worker">Sync Worker URL <span style="opacity:.6">(your deployed Cloudflare Worker)</span></label>
+    <input id="worker" type="text" placeholder="https://stremio-nuvio-sync.your-name.workers.dev"
+           autocomplete="off" spellcheck="false" />
+
+    <div class="row" style="margin-top:16px">
+      <button id="generate" class="btn-primary">Generate add-on URL</button>
+      <button id="test" class="btn-ghost" disabled>Test token</button>
+      <button id="reset" class="btn-ghost" type="button">Clear saved</button>
+    </div>
+
+    <div id="testStatus" class="status"></div>
+
+    <div id="urlbox" class="urlbox">
+      <label>Your personal add-on URL &mdash; install this in both Stremio and Nuvio</label>
+      <div class="field">
+        <input id="addonUrl" type="text" readonly />
+        <button id="copy" class="btn-ghost">Copy</button>
+      </div>
+      <p class="hint">
+        The token lives in the URL path &mdash; that is the whole &ldquo;login&rdquo; system.
+        Treat this URL like a password: it grants access to your Nuvio progress.
+      </p>
+    </div>
+  </section>
+
+  <!-- ================= STEP 2: install ================= -->
+  <section class="card" id="installCard" style="display:none">
+    <h2><span class="num">2</span> Install in your apps</h2>
+    <p class="sub">The same URL works in Stremio and Nuvio &mdash; both speak the Stremio addon protocol.</p>
+
+    <div class="qr-area">
+      <div id="qrcode" title="Scan with Nuvio TV &rarr; Manage from phone"></div>
+      <div>
+        <p style="margin:0 0 6px;font-size:14px"><b>Nuvio TV:</b> Addons &rarr; <i>Manage from phone</i> &rarr; scan this QR code</p>
+        <p style="margin:0;font-size:13px;color:var(--text-dim)">Phones can also open this page and copy the URL.</p>
+      </div>
+    </div>
+
+    <ol class="steps" style="margin-top:20px">
+      <li><b>Stremio (Desktop / Web / Android / TV):</b>
+        open <code>Addons</code> &rarr; paste the URL above &rarr; Install.
+        You should see a new <i>Continue Watching (Nuvio)</i> row.</li>
+      <li><b>Nuvio (Android / TV / Desktop):</b>
+        <code>Settings &rarr; Content &amp; Discovery &rarr; Addons</code> &rarr;
+        paste the same URL into <i>Add Addon</i> &rarr; Install.</li>
+      <li><b>Watch something in Stremio.</b> Start, pause, seek and close events are
+        pushed to your Nuvio account within seconds. Open Nuvio&rsquo;s
+        <i>Continue Watching</i> &mdash; the movie is there with its position.</li>
+      <li><b>Watch something in Nuvio</b> (if your client also emits player events),
+        then open Stremio&rsquo;s <i>Continue Watching (Nuvio)</i> row to resume.</li>
+    </ol>
+  </section>
+
+  <!-- ================= how it works ================= -->
+  <details>
+    <summary>How it works (and how to verify it is syncing)</summary>
+
+    <p>The addon is a stateless Cloudflare Worker. It declares the Stremio protocol&rsquo;s
+    <b>event resources</b>, which is the part most addons never use: instead of serving
+    content, the addon <i>receives</i> your activity.</p>
+
+    <table class="spec">
+      <tr><th>Stremio sends</th><th>Worker does</th></tr>
+      <tr>
+        <td><code>/player/movie/tt0137523/action=start&amp;currentTime=0&amp;duration=7200000.json</code></td>
+        <td>Parses <code>action</code>, <code>currentTime</code> (ms), <code>duration</code> (ms) from the path, then POSTs to <code>sync_push_watch_progress</code>.</td>
+      </tr>
+      <tr>
+        <td><code>.../action=pause&amp;currentTime=1830000&amp;duration=7200000.json</code></td>
+        <td>Pushes position 1&thinsp;830&thinsp;000&nbsp;ms (30:30) to Nuvio &mdash; that is your resume point.</td>
+      </tr>
+      <tr>
+        <td><code>.../action=stop&amp;currentTime=6900000&amp;duration=7200000.json</code></td>
+        <td>Fires even when the player closes or the app exits abruptly. Pushes the final position; Nuvio auto-marks watched at &ge;90%.</td>
+      </tr>
+      <tr>
+        <td><code>/library/movie/tt0137523/action=watched.json</code></td>
+        <td>Pushes a watched-history item to Nuvio.</td>
+      </tr>
+      <tr>
+        <td><code>/catalog/movie/nuviocw.json</code> (you opening Stremio)</td>
+        <td>Pulls your Nuvio progress and renders the <i>Continue Watching (Nuvio)</i> row.</td>
+      </tr>
+    </table>
+
+    <p style="margin-top:14px"><b>Verify it works:</b> the addon operator can run
+    <code>npx wrangler tail</code> (or open the Worker&rsquo;s Logs in the Cloudflare dashboard)
+    &mdash; every <code>[player]</code> line shows the parsed action, position and duration
+    arriving live during playback.</p>
+
+    <p><b>Note:</b> player events are a recent protocol addition. If your Stremio build does
+    not send them yet, you will see no <code>[player]</code> lines in the logs &mdash; in that
+    case only the catalog row (Nuvio&rarr;Stremio resume) and watched toggles sync.
+    Updating Stremio/Nuvio to the latest version is the fix.</p>
+
+    <p><b>Privacy:</b> no server stores anything. Your token is read from the URL on each
+    request, used for one call to Nuvio&rsquo;s API, and discarded. You can revoke access
+    instantly by regenerating your token or uninstalling the addon in both apps.</p>
+  </details>
+
+  <footer>
+    100% free &amp; open &middot; GitHub Pages + Cloudflare Workers &middot;
+    no database, no accounts, no tracking
+  </footer>
+</div>
+
+<!-- QR code generator (CDN, optional enhancement - page works without it) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- Element handles -----------------------------------------------------
+  var $ = function (id) { return document.getElementById(id); };
+  var tokenInput = $("token");
+  var profileInput = $("profile");
+  var workerInput = $("worker");
+  var generateBtn = $("generate");
+  var testBtn = $("test");
+  var resetBtn = $("reset");
+  var testStatus = $("testStatus");
+  var urlBox = $("urlbox");
+  var addonUrlInput = $("addonUrl");
+  var copyBtn = $("copy");
+  var installCard = $("installCard");
+  var qrHost = $("qrcode");
+
+  var LS_KEY = "nuvio-sync-prefs";
+
+  // ---- Persistence (this browser only, for convenience) --------------------
+  function loadPrefs() {
+    try {
+      var raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      var prefs = JSON.parse(raw);
+      if (prefs.worker) workerInput.value = prefs.worker;
+      if (prefs.token) tokenInput.value = prefs.token;
+      if (prefs.profile) profileInput.value = prefs.profile;
+    } catch (e) { /* storage unavailable - ignore */ }
+  }
+  function savePrefs() {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        worker: workerInput.value.trim(),
+        token: tokenInput.value.trim(),
+        profile: profileInput.value
+      }));
+    } catch (e) { /* storage unavailable - ignore */ }
+  }
+
+  // ---- URL building ---------------------------------------------------------
+  /**
+   * Build the addon manifest URL.
+   *
+   * Shape:  https://<worker>/t/<nuvioToken>@<profile>/manifest.json
+   *
+   * Why the token is in the PATH and not the query string: Stremio's HTTP
+   * transport derives every subsequent resource request from the directory
+   * the manifest was installed from, so the /t/<token>/ prefix is
+   * automatically re-appended to every player/catalog/library request.
+   * Query strings on the manifest URL are NOT preserved by the client.
+   *
+   * encodeURIComponent keeps tokens with unusual characters URL-safe.
+   */
+  function buildAddonUrl() {
+    var worker = workerInput.value.trim().replace(/\/+$/, "");
+    var token = encodeURIComponent(tokenInput.value.trim());
+    var profile = parseInt(profileInput.value, 10) || 1;
+    return worker + "/t/" + token + "@" + profile + "/manifest.json";
+  }
+
+  // ---- Status helper ---------------------------------------------------------
+  function setStatus(el, msg, kind) {
+    el.textContent = msg;
+    el.className = "status show " + (kind || "");
+  }
+
+  // ---- QR code (optional enhancement) ---------------------------------------
+  function renderQr(url) {
+    qrHost.innerHTML = "";
+    qrHost.classList.remove("show");
+    if (typeof QRCode === "undefined") return; // CDN blocked - skip quietly
+    try {
+      new QRCode(qrHost, { text: url, width: 168, height: 168, correctLevel: QRCode.CorrectLevel.M });
+      qrHost.classList.add("show");
+    } catch (e) { /* ignore */ }
+  }
+
+  // ---- Test the token against the Worker's /health probe ---------------------
+  function testToken() {
+    var worker = workerInput.value.trim().replace(/\/+$/, "");
+    var token = tokenInput.value.trim();
+    if (!worker || !token) {
+      setStatus(testStatus, "Enter both the Worker URL and your Nuvio token first.", "err");
+      return;
+    }
+    setStatus(testStatus, "Testing token&hellip;", "");
+    testBtn.disabled = true;
+
+    var profile = parseInt(profileInput.value, 10) || 1;
+    fetch(worker + "/t/" + encodeURIComponent(token) + "@" + profile + "/health")
+      .then(function (res) {
+        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
+      })
+      .then(function (r) {
+        if (r.ok && r.body && r.body.ok) {
+          var names = Array.isArray(r.body.profiles)
+            ? r.body.profiles.map(function (p) { return (p.name || "profile") + " #" + p.profile_index; }).join(", ")
+            : "connected";
+          setStatus(testStatus, "Token valid &mdash; " + names, "ok");
+        } else {
+          setStatus(testStatus, "Nuvio rejected the token" + (r.body && r.body.error ? ": " + r.body.error : ""), "err");
+        }
+      })
+      .catch(function () {
+        setStatus(testStatus, "Could not reach the Worker. Check the URL.", "err");
+      })
+      .then(function () { testBtn.disabled = false; });
+  }
+
+  // ---- Generate ---------------------------------------------------------------
+  function generate() {
+    if (!workerInput.value.trim() || !tokenInput.value.trim()) {
+      setStatus(testStatus, "Enter both the Worker URL and your Nuvio token first.", "err");
+      return;
+    }
+    savePrefs();
+    var url = buildAddonUrl();
+    addonUrlInput.value = url;
+    urlBox.classList.add("show");
+    installCard.style.display = "block";
+    renderQr(url);
+    setStatus(testStatus, "", "");
+  }
+
+  // ---- Wiring -----------------------------------------------------------------
+  generateBtn.addEventListener("click", generate);
+  testBtn.addEventListener("click", function () { savePrefs(); testToken(); });
+  resetBtn.addEventListener("click", function () {
+    try { localStorage.removeItem(LS_KEY); } catch (e) {}
+    tokenInput.value = ""; profileInput.value = "1";
+    urlBox.classList.remove("show"); installCard.style.display = "none";
+    setStatus(testStatus, "Saved details cleared.", "");
+  });
+  copyBtn.addEventListener("click", function () {
+    addonUrlInput.select();
+    var done = function () { copyBtn.textContent = "Copied"; setTimeout(function () { copyBtn.textContent = "Copy"; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(addonUrlInput.value).then(done, function () { document.execCommand("copy"); done(); });
+    } else {
+      document.execCommand("copy"); done();
+    }
+  });
+  // Enable the Test button as soon as both fields have content.
+  function refreshTestState() { testBtn.disabled = !(workerInput.value.trim() && tokenInput.value.trim()); }
+  workerInput.addEventListener("input", refreshTestState);
+  tokenInput.addEventListener("input", refreshTestState);
+
+  loadPrefs();
+  refreshTestState();
+})();
+</script>
+</body>
+</html>

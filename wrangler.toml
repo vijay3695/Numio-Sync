@@ -1,0 +1,34 @@
+# wrangler.toml - Cloudflare Worker deployment config
+#
+# Deploy:  npx wrangler deploy
+# Logs:    npx wrangler tail      (watch [player] events arrive live)
+#
+# Free tier: 100k requests/day, no cold starts - enough for tens of
+# thousands of playback events daily.
+
+name = "stremio-nuvio-sync"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# ---------------------------------------------------------------------------
+# VARIABLES (plain, non-secret)
+# ---------------------------------------------------------------------------
+[vars]
+# Nuvio API base (every sync RPC lives under {base}/rest/v1/rpc/...)
+NUVIO_BASE = "https://api.nuvio.tv"
+
+# Nuvio profile used when the install URL does not carry `@<profile>` (1-6)
+PROFILE_ID = "1"
+
+# Cinemeta base, used only to decorate the Continue Watching catalog
+# with posters/names. Optional.
+# CINEMETA = "https://v3-cinemeta.strem.fun"
+
+# ---------------------------------------------------------------------------
+# SECRETS (set with:  npx wrangler secret put NUVIO_PUB_KEY)
+# ---------------------------------------------------------------------------
+# Nuvio's publishable client key. It ships inside every Nuvio client (same
+# role as a Supabase anon key) and identifies the app, not the user.
+# The default baked into worker.js works out of the box; only override this
+# if Nuvio rotates it.
+# NUVIO_PUB_KEY = "sb_publishable_..."
