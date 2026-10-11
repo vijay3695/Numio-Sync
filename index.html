@@ -251,6 +251,14 @@
         The token lives in the URL path &mdash; that is the whole &ldquo;login&rdquo; system.
         Treat this URL like a password: it grants access to your Nuvio progress.
       </p>
+      <p style="margin-top:12px">
+        <a id="debugLink" href="#" target="_blank" rel="noopener"
+           style="color:var(--accent);font-size:13.5px;text-decoration:none">Run sync self-check &rarr;</a>
+        <span class="hint" style="display:block;margin-top:4px">
+          Checks both logins, counts your Continue Watching items, shows what will be
+          written next and lists the playback events this Worker has seen. No terminal, no logs.
+        </span>
+      </p>
     </div>
   </section>
 
@@ -576,6 +584,8 @@
     }
     var url = buildAddonUrl(accessToken);
     addonUrlInput.value = url;
+    // The self-check lives at the same path with /manifest.json swapped out.
+    document.getElementById("debugLink").href = url.replace(/\/manifest\.json$/, "/debug");
     urlBox.classList.add("show");
     installCard.style.display = "block";
     renderQr(url);

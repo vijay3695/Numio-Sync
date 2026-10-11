@@ -122,6 +122,19 @@ const DEFAULT_PROFILE_ID = 1;
 /** Max rows returned by the Continue Watching catalog. */
 const CATALOG_LIMIT = 40;
 
+/**
+ * Recent activity ring buffer, used by the /debug self-check page. Per-isolate
+ * (a low-traffic Worker effectively has one), best-effort by design - and it
+ * ONLY ever records event type, ids, positions and timestamps. Tokens, keys,
+ * emails and passwords are never stored anywhere, including here.
+ */
+const RECENT_LIMIT = 25;
+const recentActivity = [];
+function noteActivity(kind, detail) {
+  recentActivity.unshift({ t: Date.now(), kind, detail });
+  if (recentActivity.length > RECENT_LIMIT) recentActivity.pop();
+}
+
 // ---------------------------------------------------------------------------
 // SMALL HELPERS
 // ---------------------------------------------------------------------------
@@ -636,13 +649,20 @@ async function stremioGetUser(cfg, authKey) {
   return stremioApi(cfg, 'getUser', { type: 'GetUser', authKey });
 }
 
-/** Read library items: POST /api/datastoreGet { authKey, collection, ids, all }. */
+/**
+ * Read library items: POST /api/datastoreGet { authKey, collection, ids, all }.
+ *
+ * `all: true` only when NO ids are requested - note an empty array is truthy
+ * in JS, so the length check matters (passing [] must mean "the whole
+ * library", not "nothing").
+ */
 async function stremioDatastoreGet(cfg, authKey, ids) {
+  const hasIds = Array.isArray(ids) && ids.length > 0;
   return stremioApi(cfg, 'datastoreGet', {
     authKey,
     collection: 'libraryItem',
-    ids: ids || [],
-    all: ids ? false : true,
+    ids: hasIds ? ids : [],
+    all: !hasIds,
   });
 }
 
@@ -807,6 +827,7 @@ async function syncProgressToStremio(cfg, stremioKey, rows, metaMap) {
         const merged = mergeStremioItem(item, existing);
         await stremioDatastorePut(cfg, stremioKey, [merged]);
         written += 1;
+        noteActivity('write-stremio', `${row.content_id} @ ${toInt(row.position, 0)}ms`);
         console.log(
           `[stremio] wrote resume point for ${row.content_id} @ ${toInt(row.position, 0)}ms ` +
           `(${existing ? 'merged into existing ' + (existing.temp ? 'temp' : 'library') + ' item' : 'new library item'})`
@@ -856,6 +877,7 @@ async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profil
     `[player] ${action} ${type}:${videoId} @ ${currentTime}/${duration}ms ` +
     `(profile ${profileId})`
   );
+  noteActivity('player', `${action} ${type}:${videoId} @ ${currentTime}/${duration}ms`);
 
   if (!known.has(action)) return eventOk();
 
@@ -881,6 +903,7 @@ async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profil
     await pushProgress(cfg, token, profileId, entry);
     const pct = Math.round((currentTime / duration) * 100);
     console.log(`[player] pushed ${entry.content_id} at ${pct}% to Nuvio profile ${profileId}`);
+    noteActivity('push-nuvio', `${entry.content_id} at ${pct}% (profile ${profileId})`);
   } catch (err) {
     // Never break playback because of a sync failure.
     console.error(`[player] push failed: ${err.message}`);
@@ -1169,9 +1192,160 @@ async function autoSyncFromManifest(cfg, token, profileId, stremioKey) {
     }
     const { written } = await syncProgressToStremio(cfg, stremioKey, rows, metaMap);
     console.log(`[auto-sync] manifest-triggered sync complete: ${written} resume point(s) written`);
+    noteActivity('auto-sync', `manifest-triggered: ${written} resume point(s) written`);
   } catch (err) {
     console.error(`[auto-sync] failed: ${err.message}`);
   }
+}
+
+/**
+ * Self-check page: /t/<token>@<profile>/s/<stremioKey>/debug
+ *
+ * Runs the whole chain live and reports it as a readable page, so nobody has
+ * to install wrangler or read logs to know whether their sync works:
+ *
+ *   1. is the Nuvio token valid, and which profiles exist
+ *   2. is the Stremio account linked and valid (the /s/ segment)
+ *   3. how many Continue Watching items Nuvio has, and the most recent one
+ *   4. how many items the Stremio account library holds
+ *   5. how many resume points this sync WOULD write right now
+ *   6. the recent event activity this Worker instance has seen
+ *
+ * Read-only except for nothing - it writes nothing anywhere.
+ */
+async function handleDebug(cfg, token, profileId, stremioKey) {
+  const checks = [];
+  const ok = (label, value, good) => checks.push({ label, value, good });
+
+  // 1. Nuvio token
+  let profiles = [];
+  try {
+    const rows = await nuvioRpc(cfg, token, 'sync_pull_profiles', {});
+    profiles = Array.isArray(rows) ? rows : [];
+    ok('Nuvio token', `valid - ${profiles.length} profile(s): ` +
+      profiles.map((p) => `${p.name || 'profile'} #${p.profile_index}`).join(', '), true);
+  } catch (err) {
+    ok('Nuvio token', `INVALID - ${err.message}`, false);
+  }
+
+  // 2. Stremio link
+  if (stremioKey) {
+    try {
+      const user = await stremioGetUser(cfg, stremioKey);
+      ok('Stremio account', `linked and valid (user ${user && user._id ? user._id : 'unknown'})`, true);
+    } catch (err) {
+      ok('Stremio account', `link present but REJECTED - ${err.message}`, false);
+    }
+  } else {
+    ok('Stremio account', 'NOT LINKED - Nuvio progress cannot resume inside Stremio. ' +
+      'Use "Link Stremio" on the start page and reinstall the generated URL.', false);
+  }
+
+  // 3. Nuvio progress
+  let rows = [];
+  try {
+    rows = await pullProgress(cfg, token, profileId, CATALOG_LIMIT);
+    const newest = rows[0];
+    ok('Nuvio Continue Watching', `${rows.length} item(s)` +
+      (newest ? ` - most recent: ${newest.content_id} at ${Math.round((newest.position / Math.max(newest.duration, 1)) * 100)}%` : ''), rows.length > 0);
+  } catch (err) {
+    ok('Nuvio Continue Watching', `could not read - ${err.message}`, false);
+  }
+
+  // 4. Stremio library size
+  if (stremioKey) {
+    try {
+      const items = await stremioDatastoreGet(cfg, stremioKey, []);
+      const arr = Array.isArray(items) ? items : [];
+      ok('Stremio library', `${arr.length} item(s) in the account`, true);
+    } catch (err) {
+      ok('Stremio library', `could not read - ${err.message}`, false);
+    }
+  }
+
+  // 5. What a sync would write right now (simulated, nothing written)
+  if (stremioKey && rows.length) {
+    try {
+      const existing = await stremioDatastoreGet(cfg, stremioKey, rows.filter((r) => r.content_id).map((r) => r.content_id));
+      const byId = new Map();
+      if (Array.isArray(existing)) for (const it of existing) if (it && it._id) byId.set(it._id, it);
+      const wouldWrite = rows.filter((r) => r.content_id && isNewerThanStremio(r, byId.get(r.content_id))).length;
+      ok('Pending sync', wouldWrite > 0
+        ? `${wouldWrite} resume point(s) are newer than Stremio's copy - these will be written on the next manifest fetch (open either app) or catalog visit`
+        : 'everything in Nuvio is already mirrored into Stremio', true);
+    } catch (err) {
+      ok('Pending sync', `could not compare - ${err.message}`, false);
+    }
+  }
+
+  // 6. Recent activity seen by this Worker instance
+  const activity = recentActivity.slice(0, 12).map((e) => ({
+    t: new Date(e.t).toISOString().replace('T', ' ').slice(0, 19),
+    kind: e.kind,
+    detail: e.detail,
+  }));
+
+  return htmlResponse(debugReportHtml(checks, activity, profileId));
+}
+
+/** HTML response with tight headers (no scripts needed on this page). */
+function htmlResponse(body) {
+  return new Response(body, {
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:",
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'no-referrer',
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function debugReportHtml(checks, activity, profileId) {
+  const rows = checks.map((c) => `
+    <tr>
+      <td class="k">${esc(c.label)}</td>
+      <td class="${c.good ? 'ok' : 'bad'}">${esc(c.value)}</td>
+    </tr>`).join('');
+
+  const acts = activity.length
+    ? activity.map((a) => `<tr><td class="tt">${esc(a.t)}</td><td class="k">${esc(a.kind)}</td><td>${esc(a.detail)}</td></tr>`).join('')
+    : `<tr><td colspan="3" class="dim">no events seen by this Worker instance yet - play something in either app, then reload this page</td></tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sync self-check</title>
+<style>
+  body{background:#0a0a0f;color:#e8e8f0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;padding:28px}
+  .c{max-width:760px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:#9a9ab0;margin:0 0 22px}
+  h2{font-size:14px;color:#9a9ab0;text-transform:uppercase;letter-spacing:.06em;margin:26px 0 8px}
+  table{width:100%;border-collapse:collapse;background:#12121a;border:1px solid #262636;border-radius:10px;overflow:hidden}
+  td{padding:9px 12px;border-bottom:1px solid #262636;vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td.k{color:#9a9ab0;width:34%}
+  .ok{color:#34d399}.bad{color:#f87171}
+  .tt{color:#6b6b85;font-family:ui-monospace,monospace;white-space:nowrap}
+  .dim{color:#6b6b85}
+  .foot{margin-top:22px;color:#6b6b85;font-size:12.5px}
+</style></head><body><div class="c">
+<h1>Sync self-check</h1>
+<p class="sub">Profile #${esc(profileId)} &middot; read-only &middot; nothing here is stored anywhere</p>
+<h2>Connection</h2><table>${rows}</table>
+<h2>Recent events (this Worker instance)</h2><table>${acts}</table>
+<p class="foot">Events are held in memory by the Worker instance that served them and are never persisted.
+If <em>player</em> events never appear here, that app is not emitting playback events - the sync then relies on
+the automatic manifest fetch (opening either app) and the Continue Watching row.</p>
+</div></body></html>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,6 +1481,11 @@ export default {
           { error: 'missing_token', hint: 'install URL must be /t/<nuvioToken>@<profile>/manifest.json' },
           400
         );
+      }
+
+      // ---- self-check page (replaces "run wrangler tail" for users) --------
+      if (head === 'debug') {
+        return await handleDebug(cfg, token, profileId, stremioKey);
       }
 
       // ---- health probe (used by the GitHub Pages UI to test a token) ----
@@ -1687,6 +1866,14 @@ const INDEX_HTML = `<!DOCTYPE html>
         The token lives in the URL path &mdash; that is the whole &ldquo;login&rdquo; system.
         Treat this URL like a password: it grants access to your Nuvio progress.
       </p>
+      <p style="margin-top:12px">
+        <a id="debugLink" href="#" target="_blank" rel="noopener"
+           style="color:var(--accent);font-size:13.5px;text-decoration:none">Run sync self-check &rarr;</a>
+        <span class="hint" style="display:block;margin-top:4px">
+          Checks both logins, counts your Continue Watching items, shows what will be
+          written next and lists the playback events this Worker has seen. No terminal, no logs.
+        </span>
+      </p>
     </div>
   </section>
 
@@ -2012,6 +2199,8 @@ const INDEX_HTML = `<!DOCTYPE html>
     }
     var url = buildAddonUrl(accessToken);
     addonUrlInput.value = url;
+    // The self-check lives at the same path with /manifest.json swapped out.
+    document.getElementById("debugLink").href = url.replace(/\\/manifest\\.json$/, "/debug");
     urlBox.classList.add("show");
     installCard.style.display = "block";
     renderQr(url);
