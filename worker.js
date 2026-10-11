@@ -769,6 +769,10 @@ function isNewerThanStremio(row, existing) {
  * Writes at most STREMIO_WRITE_BATCH items per call; without storage there
  * is no durable queue, so the remainder are simply picked up on the next
  * catalog request (they are still newer than Stremio's copy).
+ *
+ * `metaMap` is optional (id -> { name, poster }): the catalog path passes the
+ * library-join map, the real-time player-event path passes nothing and the
+ * merge with any existing Stremio item still supplies the real title.
  */
 const STREMIO_WRITE_BATCH = 10;
 
@@ -797,7 +801,7 @@ async function syncProgressToStremio(cfg, stremioKey, rows, metaMap) {
       if (!isNewerThanStremio(row, existing)) continue;
       try {
         const item = buildStremioLibraryItem(row, cfg);
-        const meta = metaMap.get(row.content_id);
+        const meta = metaMap && metaMap.get(row.content_id);
         if (meta && meta.name) item.name = meta.name;
         if (meta && meta.poster) item.poster = meta.poster;
         const merged = mergeStremioItem(item, existing);
@@ -999,7 +1003,7 @@ async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey,
     // Titles/posters come from the user's OWN libraries (Nuvio + Stremio),
     // never from a third-party metadata service. Where we have nothing, the
     // raw id is shown and the client may still resolve it itself.
-    const meta = metaMap.get(row.content_id);
+    const meta = metaMap && metaMap.get(row.content_id);
     const base = {
       id: row.content_id,
       type: wantedType,
