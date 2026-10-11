@@ -204,6 +204,28 @@ function toInt(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/**
+ * Origin guard for the sign-in endpoints.
+ *
+ * Accepts: no Origin header (same-origin POST from our own page - Firefox and
+ * several WebViews simply do not send one), our own origin, and the optional
+ * configured allowlist entry. Blocks everything else.
+ *
+ * Note on the threat model: CORS already stops any third-party page from
+ * READING a response; this guard only stops casual misuse of the endpoints,
+ * so it must never be strict enough to break our own page.
+ */
+function isAllowedOrigin(request, cfg) {
+  const origin = request.headers.get('Origin');
+  if (!origin) return true;
+  try {
+    if (origin === new URL(request.url).origin) return true;
+  } catch {
+    return false;
+  }
+  return !!(cfg.allowedOrigin && origin === cfg.allowedOrigin);
+}
+
 /** Read configuration, letting wrangler env bindings win over defaults. */
 function getConfig(env) {
   return {
@@ -373,13 +395,8 @@ function loginErrorMessage(err) {
  * can write resume points into the user's Stremio library.
  */
 async function handleStremioLogin(request, cfg) {
-  // Optional origin pinning (same as /login).
-  const allowed = cfg.allowedOrigin;
-  if (allowed) {
-    const origin = request.headers.get('Origin') || '';
-    if (origin !== allowed) {
-      return json({ ok: false, error: 'origin_not_allowed' }, 403);
-    }
+  if (!isAllowedOrigin(request, cfg)) {
+    return json({ ok: false, error: 'origin_not_allowed' }, 403);
   }
 
   let body;
@@ -426,15 +443,8 @@ async function handleStremioLogin(request, cfg) {
  * profiles are returned so the UI can show real profile names.
  */
 async function handleLogin(request, cfg) {
-  // Optional origin pinning: set ALLOWED_ORIGIN to your GitHub Pages origin
-  // (e.g. https://vijay3695.github.io) to stop this endpoint being used as a
-  // generic Nuvio credential-checking oracle. Empty by default.
-  const allowed = cfg.allowedOrigin;
-  if (allowed) {
-    const origin = request.headers.get('Origin') || '';
-    if (origin !== allowed) {
-      return json({ ok: false, error: 'origin_not_allowed' }, 403);
-    }
+  if (!isAllowedOrigin(request, cfg)) {
+    return json({ ok: false, error: 'origin_not_allowed' }, 403);
   }
 
   let body;
@@ -727,7 +737,7 @@ function isNewerThanStremio(row, existing) {
  */
 const STREMIO_WRITE_BATCH = 10;
 
-async function syncProgressToStremio(cfg, stremioKey, rows) {
+async function syncProgressToStremio(cfg, stremioKey, rows, metaMap) {
   if (!stremioKey || !Array.isArray(rows) || !rows.length) return { written: 0 };
 
   // Only rows that actually carry a resumable position.
@@ -751,7 +761,11 @@ async function syncProgressToStremio(cfg, stremioKey, rows) {
       const existing = byId.get(row.content_id);
       if (!isNewerThanStremio(row, existing)) continue;
       try {
-        const merged = mergeStremioItem(buildStremioLibraryItem(row, cfg), existing);
+        const item = buildStremioLibraryItem(row, cfg);
+        const meta = metaMap.get(row.content_id);
+        if (meta && meta.name) item.name = meta.name;
+        if (meta && meta.poster) item.poster = meta.poster;
+        const merged = mergeStremioItem(item, existing);
         await stremioDatastorePut(cfg, stremioKey, [merged]);
         written += 1;
         console.log(
@@ -927,6 +941,10 @@ async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey,
   if (catalogId !== 'nuviocw' && catalogId !== 'nuviowatched') return json({ metas: [] });
 
   const wantedType = type === 'series' ? 'series' : 'movie';
+
+  // Titles/posters for the row, from the user's own libraries (cached).
+  const metaMap = await pullLibraryMeta(cfg, token, profileId, stremioKey).catch(() => new Map());
+
   let rows = [];
   try {
     rows = catalogId === 'nuviocw'
@@ -943,14 +961,15 @@ async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey,
     if (row.content_type && row.content_type !== wantedType) continue;
     if (!row.content_id) continue;
 
-    // No metadata fetching here on purpose: the client resolves id -> title
-    // and poster through the user's own installed meta addons (see the
-    // METADATA POLICY note at the top of this file). We return only the
-    // reference, which keeps every catalog render to a single Nuvio call.
+    // Titles/posters come from the user's OWN libraries (Nuvio + Stremio),
+    // never from a third-party metadata service. Where we have nothing, the
+    // raw id is shown and the client may still resolve it itself.
+    const meta = metaMap.get(row.content_id);
     const base = {
       id: row.content_id,
       type: wantedType,
-      name: row.content_id,
+      name: (meta && meta.name) || row.content_id,
+      poster: (meta && meta.poster) || undefined,
       posterShape: 'poster',
     };
 
@@ -979,13 +998,96 @@ async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey,
   // previously this blocked the response, which is what made the row feel
   // slow. Best-effort: failures never fail the row.
   if (stremioKey && catalogId === 'nuviocw' && rows.length) {
-    const job = syncProgressToStremio(cfg, stremioKey, rows)
+    const job = syncProgressToStremio(cfg, stremioKey, rows, metaMap)
       .catch((err) => console.error(`[catalog] stremio write-back failed: ${err.message}`));
     if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
     else await job;
   }
 
   return json({ metas: metas.slice(0, CATALOG_LIMIT) });
+}
+
+// ---------------------------------------------------------------------------
+// TITLES & POSTERS - sourced from the user's OWN data (keyless)
+// ---------------------------------------------------------------------------
+
+/**
+ * The catalog rows are references; a title and poster make them usable. We do
+ * NOT call any third-party metadata provider (Cinemeta is down globally, and
+ * keys are a non-starter). Instead we join our progress rows against data the
+ * user already owns:
+ *
+ *   1. their Nuvio library      (sync_pull_library)   - works for everyone
+ *   2. their Stremio library    (datastoreGet all)    - when Stremio is linked
+ *
+ * Both are ONE cached call each (per isolate, 10 min TTL), so the join costs
+ * one extra request on a cold isolate and nothing afterwards. Stremio's copy
+ * wins where both have the title, because it carries metadata the user's own
+ * client already resolved.
+ */
+const libraryMetaCache = new Map(); // key -> { expires, value: Map }
+const LIBRARY_META_TTL_MS = 10 * 60 * 1000;
+
+/** Harvest id -> { name, poster } from an arbitrary array of library-ish rows. */
+function harvestLibraryMeta(rows, map) {
+  if (!Array.isArray(rows)) return;
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const id = row.content_id || row._id || row.id;
+    if (typeof id !== 'string' || !/^tt\d/.test(id)) continue;
+    const name = row.name || row.title || null;
+    const poster = row.poster || row.poster_url
+      || (row.poster_path ? `https://image.tmdb.org/t/p/w300${row.poster_path}` : null)
+      || null;
+    if (name || poster) map.set(id, { name, poster });
+  }
+}
+
+/** id -> { name, poster } built from Nuvio (+ Stremio) libraries. */
+async function pullLibraryMeta(cfg, token, profileId, stremioKey) {
+  const key = `libmeta:${profileId}:${stremioKey ? 's' : 'n'}:${token ? 't' : '-'}`;
+  const hit = libraryMetaCache.get(key);
+  if (hit && hit.expires > Date.now()) return hit.value;
+
+  const map = new Map();
+
+  // 1. Nuvio library (the user's own adds - carries names and posters).
+  if (token) {
+    try {
+      const rows = await nuvioRpc(cfg, token, 'sync_pull_library', {
+        p_profile_id: profileId,
+        p_limit: 500,
+      });
+      harvestLibraryMeta(rows, map);
+    } catch {
+      /* library is optional */
+    }
+  }
+
+  // 2. Stremio library (client-resolved metadata, so it wins on conflict).
+  if (stremioKey) {
+    try {
+      const res = await fetch(`${cfg.stremioApi}/datastoreGet`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'User-Agent': 'stremio-nuvio-sync/1.0' },
+        body: JSON.stringify({ authKey: stremioKey, collection: 'libraryItem', ids: [], all: true }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const items = data && data.result ? data.result : [];
+        for (const item of items) {
+          if (!item || typeof item._id !== 'string' || !/^tt\d/.test(item._id)) continue;
+          if (item.name || item.poster) map.set(item._id, { name: item.name, poster: item.poster });
+        }
+      }
+    } catch {
+      /* library is optional */
+    }
+  }
+
+  libraryMetaCache.set(key, { expires: Date.now() + LIBRARY_META_TTL_MS, value: map });
+  console.log(`[meta] library join built: ${map.size} titled ids`);
+  return map;
 }
 
 // ---------------------------------------------------------------------------
