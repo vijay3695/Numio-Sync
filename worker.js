@@ -129,14 +129,49 @@ const CATALOG_LIMIT = 40;
 /**
  * CORS is mandatory: "each route, including /manifest.json, must serve
  * CORS headers that allow all origins" - Stremio protocol doc. POST is
- * included because the /login endpoint (used by the GitHub Pages sign-in
- * form) is a cross-origin POST from the Pages origin.
+ * included because the /login endpoint is consumed by the sign-in page.
  */
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,HEAD,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
 };
+
+/**
+ * Security headers for the HTML page.
+ *
+ * CSP uses a PER-REQUEST NONCE for the inline script instead of
+ * 'unsafe-inline', so an injected <script> tag cannot execute even if some
+ * future change ever reflected user data into the page. connect-src is
+ * 'self' because the page only ever calls this same Worker (sign-in and
+ * addon URLs), which also means a compromised CDN cannot exfiltrate anything.
+ *
+ * frame-ancestors/nosniff/no-referrer close clickjacking, MIME-sniffing and
+ * referrer leakage (the addon URL in the page carries tokens).
+ *
+ * Styles keep 'unsafe-inline': the page is a single file with inline styles,
+ * and style injection cannot execute script under this policy.
+ */
+function securityHeaders(nonce) {
+  const csp = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "img-src 'self' data: https:",
+    "font-src 'self' data:",
+    "style-src 'self' 'unsafe-inline'",
+    `script-src 'nonce-${nonce}' https://cdnjs.cloudflare.com`,
+    "connect-src 'self'",
+  ].join('; ');
+  return {
+    'Content-Security-Policy': csp,
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+  };
+}
 
 /** Build a JSON response with the mandatory CORS headers. */
 function json(data, status = 200) {
@@ -1152,8 +1187,17 @@ export default {
 
     // ---- Frontend (fix #5: no separate host - the Worker serves the page) ----
     if (url.pathname === '/' || url.pathname === '/index.html') {
-      return new Response(INDEX_HTML, {
-        headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS },
+      // Per-request nonce: every <script> in the page gets this exact value
+      // and the CSP only permits that nonce, so injected script tags are dead
+      // on arrival.
+      const nonce = crypto.randomUUID().replace(/-/g, '');
+      const html = INDEX_HTML.replace(/<script/g, `<script nonce="${nonce}"`);
+      return new Response(html, {
+        headers: {
+          'Content-Type': 'text/html; charset=utf-8',
+          ...CORS_HEADERS,
+          ...securityHeaders(nonce),
+        },
       });
     }
 
