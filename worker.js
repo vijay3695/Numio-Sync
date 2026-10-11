@@ -90,46 +90,29 @@ const STREMIO_API_DEFAULT = 'https://api.strem.io/api';
 const STREMIO_PROGRESS_TEMP_DEFAULT = true;
 
 /**
- * Metadata providers, tried in order until one answers.
+ * METADATA POLICY: we deliberately do NOT fetch or proxy metadata.
  *
- * Cinemeta is the default Stremio metadata source, but it is a single third
- * party that goes down (all strem.fun mirrors returning 530 at once). TMDB
- * is used as a reliable fallback when NUVIO_TMDB_KEY (a free TMDB API key)
- * is configured - without a key only the Cinemeta mirrors are used.
+ * The Stremio/Nuvio clients already have the user's own meta addons installed
+ * (Cinemeta, TMDB, AIOStreams, ...) and resolve titles/posters themselves.
+ * Proxying from here was tried and rejected:
+ *
+ *   - it added 4-6 extra subrequests -- plus a manifest fetch to every
+ *     installed addon host -- to EVERY catalog render, making rows slow;
+ *   - it exposed the user's installed-addon list to this Worker;
+ *   - it depended on third parties that go down (every Cinemeta mirror was
+ *     returning 530), so no fallback could be made reliable anyway.
+ *
+ * The catalog therefore returns bare references (id + type) and the client's
+ * own metadata addons do the resolution -- exactly how they already do it for
+ * every other addon. No API keys, and this Worker only ever calls Nuvio's and
+ * Stremio's own APIs.
  */
-const CINEMETA_MIRRORS = [
-  'https://v3-cinemeta.strem.fun',
-  'https://v2-cinemeta.strem.fun',
-  'https://cinemeta.strem.fun',
-];
-
-/** Our own addon id - used to exclude ourselves from the user's addon list
- *  when proxying metadata (prevents infinite recursion). */
-const OUR_ADDON_ID = 'org.stremionuvio.sync.bridge';
-
-/** Separate caches for the user's addon list and their manifests. */
-const addonListCache = new Map();  // key -> { expires, value: string[] }
-const addonManifestCache = new Map(); // url -> { expires, value: manifest|null }
-const ADDON_TTL_MS = 10 * 60 * 1000;
-const TMDB_API_DEFAULT = 'https://api.themoviedb.org/3';
 
 /** Profile used when the install URL does not carry `@<profile>`. */
 const DEFAULT_PROFILE_ID = 1;
 
 /** Max rows returned by the Continue Watching catalog. */
 const CATALOG_LIMIT = 40;
-
-/**
- * Per-isolate in-memory cache for metadata lookups (and their failures).
- * Purely an optimization; a cold isolate simply refetches.
- *
- * Failures get a SHORT ttl (negative cache): when a provider is down we must
- * not retry it on every catalog render - a 40-item row would otherwise mean
- * 40+ doomed requests to a dead origin on every single page load.
- */
-const metaCache = new Map(); // key -> { expires, value }
-const META_TTL_MS = 10 * 60 * 1000;
-const META_FAIL_TTL_MS = 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // SMALL HELPERS
@@ -219,10 +202,6 @@ function getConfig(env) {
     nuvioBase: (env.NUVIO_BASE || NUVIO_BASE_DEFAULT).replace(/\/+$/, ''),
     nuvioKey: env.NUVIO_PUB_KEY || NUVIO_PUBLISHABLE_KEY_DEFAULT,
     defaultProfileId: toInt(env.PROFILE_ID, DEFAULT_PROFILE_ID) || DEFAULT_PROFILE_ID,
-    // Optional free TMDB API key (themoviedb.org) - enables TMDB as a
-    // metadata fallback when all Cinemeta mirrors are down.
-    tmdbKey: env.NUVIO_TMDB_KEY || env.TMDB_API_KEY || null,
-    tmdbBase: (env.TMDB_API_BASE || TMDB_API_DEFAULT).replace(/\/+$/, ''),
     stremioApi: (env.STREMIO_API || STREMIO_API_DEFAULT).replace(/\/+$/, ''),
     stremioTempItems: (env.STREMIO_PROGRESS_TEMP || String(STREMIO_PROGRESS_TEMP_DEFAULT)) !== 'false',
     // Optional: pin the /login endpoint to your GitHub Pages origin so it
@@ -640,13 +619,13 @@ function isoNow(offsetMs) {
  * temp/removed: temp items hold progress without pinning the title into the
  * user's library; flip STREMIO_PROGRESS_TEMP=false for library-pinned items.
  */
-function buildStremioLibraryItem(row, cfg, meta) {
+function buildStremioLibraryItem(row, cfg) {
   const type = row.content_type === 'series' ? 'series' : 'movie';
   const position = toInt(row.position, 0);
   const duration = toInt(row.duration, 0);
   const videoId = row.video_id || row.content_id;
-  const name = (meta && meta.name) || row.content_id;
-  const poster = (meta && meta.poster) || undefined;
+  const name = row.content_id; // the client resolves the real title itself
+  const poster = null;
   const now = isoNow();
 
   return {
@@ -729,8 +708,7 @@ async function syncProgressToStremio(cfg, stremioKey, rows) {
     for (const row of candidates) {
       if (!isNewerThanStremio(row, byId.get(row.content_id))) continue;
       try {
-        const meta = await fetchMeta(cfg, row.content_type === 'series' ? 'series' : 'movie', row.content_id, null, null);
-        await stremioDatastorePut(cfg, stremioKey, [buildStremioLibraryItem(row, cfg, meta)]);
+        await stremioDatastorePut(cfg, stremioKey, [buildStremioLibraryItem(row, cfg)]);
         written += 1;
         console.log(`[stremio] wrote resume point for ${row.content_id} @ ${toInt(row.position, 0)}ms`);
       } catch (err) {
@@ -763,7 +741,7 @@ async function pushProgressToStremio(cfg, stremioKey, row) {
  * failure here would break the user's playback. Everything is caught and
  * logged; the response is always 200 JSON.
  */
-async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profileId, stremioKey) {
+async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profileId, stremioKey, ctx) {
   // ---- 1. Parse the protocol's query-style parameters out of the path ----
   const args = parseExtraArgs(extraSegment);
   const action = (args.action || '').toLowerCase();
@@ -814,11 +792,12 @@ async function handlePlayerEvent(type, videoId, extraSegment, cfg, token, profil
   // through the Stremio account API. Without a linked Stremio key this is a
   // no-op and the Nuvio -> Stremio direction is display-only.
   if (stremioKey) {
-    try {
-      await pushProgressToStremio(cfg, stremioKey, entry);
-    } catch (err) {
-      console.error(`[player] stremio write-back failed: ${err.message}`);
-    }
+    // Background: the player ignores our response anyway, so there is no
+    // reason to make the event wait on Stremio's API.
+    const job = pushProgressToStremio(cfg, stremioKey, entry)
+      .catch((err) => console.error(`[player] stremio write-back failed: ${err.message}`));
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
+    else await job;
   }
 
   // Note: Nuvio auto-upserts a watched-history entry when
@@ -896,7 +875,7 @@ function handleStreamRequest(type, id) {
  * account data, render it as a Stremio row) - except the source is the
  * user's own Nuvio account.
  */
-async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey) {
+async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey, ctx) {
   // Ignore catalogs we do not declare.
   if (catalogId !== 'nuviocw' && catalogId !== 'nuviowatched') return json({ metas: [] });
 
@@ -917,14 +896,15 @@ async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey)
     if (row.content_type && row.content_type !== wantedType) continue;
     if (!row.content_id) continue;
 
-    const meta = await fetchMeta(cfg, wantedType, row.content_id, token, profileId);
+    // No metadata fetching here on purpose: the client resolves id -> title
+    // and poster through the user's own installed meta addons (see the
+    // METADATA POLICY note at the top of this file). We return only the
+    // reference, which keeps every catalog render to a single Nuvio call.
     const base = {
       id: row.content_id,
       type: wantedType,
-      name: (meta && meta.name) || row.content_id,
-      poster: (meta && meta.poster) || undefined,
+      name: row.content_id,
       posterShape: 'poster',
-      releaseInfo: (meta && meta.releaseInfo) || undefined,
     };
 
     if (catalogId === 'nuviocw') {
@@ -946,260 +926,19 @@ async function handleCatalog(type, catalogId, cfg, token, profileId, stremioKey)
 
   // Nuvio -> Stremio resume: mirror the freshly pulled progress into the
   // user's Stremio account (if linked) so Stremio's own Continue Watching
-  // resumes at the right position. Best-effort: failures never fail the row.
-  if (stremioKey && catalogId === 'nuviocw') {
-    try {
-      await syncProgressToStremio(cfg, stremioKey, rows);
-    } catch (err) {
-      console.error(`[catalog] stremio write-back failed: ${err.message}`);
-    }
+  // resumes at the right position.
+  //
+  // Runs in the BACKGROUND (ctx.waitUntil) so the catalog returns instantly:
+  // previously this blocked the response, which is what made the row feel
+  // slow. Best-effort: failures never fail the row.
+  if (stremioKey && catalogId === 'nuviocw' && rows.length) {
+    const job = syncProgressToStremio(cfg, stremioKey, rows)
+      .catch((err) => console.error(`[catalog] stremio write-back failed: ${err.message}`));
+    if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
+    else await job;
   }
 
   return json({ metas: metas.slice(0, CATALOG_LIMIT) });
-}
-
-/**
- * Pull the user's installed addon manifest URLs from THEIR Nuvio account.
- *
- * This is the keyless metadata strategy: the "providers" are whatever the
- * user already installed (Cinemeta, a TMDB addon, AIOStreams, Trakt
- * catalogs, a personal Cinemeta mirror, ...). We read their addon list with
- * the token they already gave us and proxy metadata requests to their own
- * addons - no API keys, no third-party trust, no storage.
- *
- * Cached per isolate for ADDON_TTL_MS: every catalog render would otherwise
- * re-fetch the addon list plus N manifests.
- */
-async function pullUserAddonUrls(cfg, token, profileId) {
-  const key = `addons:${profileId}`;
-  const hit = addonListCache.get(key);
-  if (hit && hit.expires > Date.now()) return hit.value;
-
-  let rows = null;
-  try {
-    rows = await nuvioRpc(cfg, token, 'sync_pull_addons', { p_profile_id: profileId, p_limit: 100 });
-  } catch {
-    // Fall back to the direct table read (same auth, same data).
-    try {
-      const res = await fetch(`${cfg.nuvioBase}/rest/v1/addons?profile_id=eq.${profileId}`, {
-        headers: { apikey: cfg.nuvioKey, Authorization: `Bearer ${token}` },
-      });
-      if (res.ok) rows = await res.json();
-    } catch {
-      /* unreachable */
-    }
-  }
-
-  // The addon row shape is not documented, so harvest every URL-looking
-  // string from the response instead of guessing field names.
-  const urls = new Set();
-  const walk = (v) => {
-    if (typeof v === 'string') {
-      const s = v.trim();
-      if (/^https?:\/\//.test(s)) urls.add(s);
-    } else if (Array.isArray(v)) {
-      v.forEach(walk);
-    } else if (v && typeof v === 'object') {
-      Object.values(v).forEach(walk);
-    }
-  };
-  walk(rows);
-
-  const list = [...urls];
-  addonListCache.set(key, { expires: Date.now() + ADDON_TTL_MS, value: list });
-  return list;
-}
-
-/** Fetch and cache an addon manifest; returns the parsed manifest or null. */
-async function fetchAddonManifest(url) {
-  const hit = addonManifestCache.get(url);
-  if (hit && hit.expires > Date.now()) return hit.value;
-
-  let manifest = null;
-  try {
-    const res = await fetch(url, { headers: { 'User-Agent': 'stremio-nuvio-sync/1.0' } });
-    if (res.ok) {
-      const data = await res.json();
-      // A manifest has id/types/resources; anything else is not an addon.
-      if (data && data.id && data.resources) manifest = data;
-    }
-  } catch {
-    /* unreachable addon - skip it */
-  }
-
-  addonManifestCache.set(url, { expires: Date.now() + ADDON_TTL_MS, value: manifest });
-  return manifest;
-}
-
-/**
- * Does this manifest provide meta for our content type?
- * `resources` may be strings ("meta") or objects ({name,types,idPrefixes}).
- */
-function manifestProvidesMeta(manifest, type) {
-  const resources = Array.isArray(manifest.resources) ? manifest.resources : [];
-  return resources.some((r) => {
-    const name = typeof r === 'string' ? r : r && r.name;
-    if (name !== 'meta') return false;
-    if (typeof r === 'object' && r) {
-      if (Array.isArray(r.types) && r.types.length && !r.types.includes(type)) return false;
-      if (Array.isArray(r.idPrefixes) && r.idPrefixes.length && !r.idPrefixes.includes('tt')) return false;
-    }
-    return true;
-  });
-}
-
-/** Base URL of an addon, given its manifest URL. */
-function addonBaseUrl(manifestUrl) {
-  return manifestUrl.replace(/manifest\.json.*$/i, '');
-}
-
-/**
- * Resolve metadata by proxying the user's OWN installed addons, in their
- * order (install order doubles as the client's priority order). Ourselves
- * are excluded to prevent recursion. Returns a Stremio-shaped meta or null.
- */
-async function fetchUserProvidedMeta(cfg, token, profileId, type, id) {
-  if (!token) return null;
-
-  let urls;
-  try {
-    urls = await pullUserAddonUrls(cfg, token, profileId);
-  } catch {
-    return null;
-  }
-
-  for (const manifestUrl of urls) {
-    let manifest;
-    try {
-      manifest = await fetchAddonManifest(manifestUrl);
-    } catch {
-      continue;
-    }
-    if (!manifest) continue;
-    if (manifest.id === OUR_ADDON_ID) continue; // never recurse into ourselves
-    if (!manifestProvidesMeta(manifest, type)) continue;
-
-    try {
-      const res = await fetch(`${addonBaseUrl(manifestUrl)}/meta/${type}/${id}.json`, {
-        headers: { 'User-Agent': 'stremio-nuvio-sync/1.0' },
-      });
-      if (!res.ok) continue;
-      const data = await res.json();
-      const meta = data && data.meta ? data.meta : null;
-      if (meta && (meta.name || meta.poster)) {
-        return { ...meta, id, type };
-      }
-    } catch {
-      /* try the next installed addon */
-    }
-  }
-  return null;
-}
-
-/**
- * Look up metadata for an IMDb tt id, trying providers in order:
- *   1. The USER'S OWN installed addons (read from their Nuvio account -
- *      Cinemeta, TMDB addon, AIOStreams, Trakt catalogs, personal mirrors).
- *      Keyless, and it honors whatever the user actually chose.
- *   2. Public Cinemeta mirrors (keyless backup when the user's list is
- *      unavailable - e.g. a metadata request that arrived without a token).
- *   3. TMDB, ONLY if the operator configured a key (off by default).
- *
- * Results - including failures - are cached per isolate. A provider outage
- * therefore costs at most one doomed request per minute, not one per item:
- * without the negative cache a 40-item catalog row would fire 40+ doomed
- * requests at a dead origin on every single page load.
- *
- * Returns a Stremio-shaped meta object ({ id, type, name, poster, ... }) or
- * null when every provider fails.
- */
-async function fetchMeta(cfg, type, id, token, profileId) {
-  const key = `meta:${type}:${id}:${token ? 'u' : 'p'}`;
-  const hit = metaCache.get(key);
-  if (hit && hit.expires > Date.now()) return hit.value;
-
-  // 1. The user's own installed addons.
-  try {
-    const userMeta = await fetchUserProvidedMeta(cfg, token, profileId, type, id);
-    if (userMeta) {
-      metaCache.set(key, { expires: Date.now() + META_TTL_MS, value: userMeta });
-      return userMeta;
-    }
-  } catch {
-    /* fall through to public mirrors */
-  }
-
-  // 2. Public Cinemeta mirrors.
-  for (const base of CINEMETA_MIRRORS) {
-    try {
-      const res = await fetch(`${base}/meta/${type}/${id}.json`, {
-        headers: { 'User-Agent': 'stremio-nuvio-sync/1.0' },
-      });
-      if (!res.ok) continue; // mirror down - try the next one
-      const data = await res.json();
-      const meta = data && data.meta ? { ...data.meta, id, type } : { id, type };
-      metaCache.set(key, { expires: Date.now() + META_TTL_MS, value: meta });
-      return meta;
-    } catch {
-      /* try next mirror */
-    }
-  }
-
-  // 3. TMDB fallback (only when the operator configured a key - off by default;
-  // the normal path is the user's own installed addons above).
-  if (cfg.tmdbKey) {
-    try {
-      const res = await fetch(`${cfg.tmdbBase}/find/${id}?external_source=imdb_id`, {
-        headers: { 'Authorization': `Bearer ${cfg.tmdbKey}`, 'User-Agent': 'stremio-nuvio-sync/1.0' },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const bucket = type === 'series' ? data.tv_results : data.movie_results;
-        const item = Array.isArray(bucket) && bucket.length ? bucket[0] : null;
-        if (item) {
-          const meta = {
-            id,
-            type,
-            name: item.name || item.title || id,
-            poster: item.poster_path ? `https://image.tmdb.org/t/p/w300${item.poster_path}` : undefined,
-            background: item.backdrop_path ? `https://image.tmdb.org/t/p/w1280${item.backdrop_path}` : undefined,
-            description: item.overview || undefined,
-            releaseInfo: (item.first_air_date || item.release_date || '').slice(0, 4) || undefined,
-            imdbRating: item.vote_average ? String(item.vote_average.toFixed(1)) : undefined,
-          };
-          metaCache.set(key, { expires: Date.now() + META_TTL_MS, value: meta });
-          return meta;
-        }
-      }
-    } catch {
-      /* TMDB unreachable */
-    }
-  }
-
-  // Negative-cache the failure briefly so a dead origin is not retried on
-  // every catalog render.
-  metaCache.set(key, { expires: Date.now() + META_FAIL_TTL_MS, value: null });
-  return null;
-}
-
-/**
- * Route: /meta/{type}/{id}.json
- *
- * Serving our own metadata makes catalog items self-contained: when a user
- * clicks an entry in the Continue Watching / Watched rows, the client asks
- * US for the details instead of hunting through every other meta addon -
- * which is exactly what made resolution take ~a minute when Cinemeta was
- * down and the client kept retrying failing providers.
- *
- * Response shape follows the Stremio protocol: { "meta": {...} }.
- */
-async function handleMetaRequest(type, id, cfg, token, profileId) {
-  const meta = await fetchMeta(cfg, type, id, token, profileId);
-  if (!meta) {
-    // Minimal but valid fallback so the client never hangs on us.
-    return json({ meta: { id, type, name: id } });
-  }
-  return json({ meta });
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,7 +973,7 @@ function parseTokenSegment(segment) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const cfg = getConfig(env || {});
     const url = new URL(request.url);
 
@@ -1311,17 +1050,6 @@ export default {
         return json(buildManifest());
       }
 
-      // ---- meta (public data - no token required) --------------------------
-      // Metadata for our own catalog rows. Served WITHOUT a token: metadata
-      // is public data and the client may request it before/additions.
-      if (head === 'meta' && rest.length >= 3) {
-        const type = rest[1];
-        const id = rest[2].replace(/\.json$/i, '');
-        // With a token we resolve via the user's own installed addons;
-        // without one we still answer from public keyless mirrors.
-        return await handleMetaRequest(type, id, cfg, token, profileId);
-      }
-
       // Routes below all require a token; without one we cannot sync.
       if (!token) {
         return json(
@@ -1345,7 +1073,7 @@ export default {
       if (head === 'catalog' && rest.length >= 3) {
         const type = rest[1];
         const catalogId = rest[2].replace(/\.json$/i, '');
-        return await handleCatalog(type, catalogId, cfg, token, profileId, stremioKey);
+        return await handleCatalog(type, catalogId, cfg, token, profileId, stremioKey, ctx);
       }
 
       if (head === 'stream' && rest.length >= 3) {
@@ -1359,7 +1087,7 @@ export default {
         const videoId = rest[2];
         // rest[3] carries action=..&currentTime=..&duration=.. (with .json)
         const extra = rest[3] || '';
-        return await handlePlayerEvent(type, videoId, extra, cfg, token, profileId, stremioKey);
+        return await handlePlayerEvent(type, videoId, extra, cfg, token, profileId, stremioKey, ctx);
       }
 
       if (head === 'library' && rest.length >= 3) {
@@ -1431,10 +1159,6 @@ function buildManifest() {
     ],
     resources: [
       { name: 'catalog', types: ['movie', 'series'], idPrefixes: ['tt'] },
-      // Our own meta resource makes the Continue Watching / Watched rows
-      // self-contained: clicking an item resolves against us (with caching),
-      // so the client never has to hunt through other meta addons.
-      { name: 'meta', types: ['movie', 'series'], idPrefixes: ['tt'] },
       { name: 'stream', types: ['movie', 'series'], idPrefixes: ['tt'] },
       { name: 'player', types: ['movie', 'series'], idPrefixes: ['tt'] },
       { name: 'library', types: ['movie', 'series'], idPrefixes: ['tt'] },
@@ -1780,6 +1504,10 @@ const INDEX_HTML = `<!DOCTYPE html>
       <tr>
         <td><code>/catalog/movie/nuviowatched.json</code></td>
         <td>Pulls your Nuvio watch history and renders the <i>Watched (Nuvio)</i> row &mdash; the same list as the <i>Watched</i> tab on your Nuvio account dashboard.</td>
+      </tr>
+      <tr>
+        <td>Title &amp; poster resolution</td>
+        <td>Not done by us. The rows return bare references and <b>your own installed meta addons</b> (Cinemeta, TMDB, AIOStreams&hellip;) resolve titles and posters &mdash; the same way they do for every other addon. That is why this Worker only ever talks to <code>api.nuvio.tv</code> and <code>api.strem.io</code>.</td>
       </tr>
       <tr>
         <td>Stremio account write-back <span style="opacity:.6">(when linked)</span></td>

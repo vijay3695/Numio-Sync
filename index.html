@@ -321,6 +321,10 @@
         <td>Pulls your Nuvio watch history and renders the <i>Watched (Nuvio)</i> row &mdash; the same list as the <i>Watched</i> tab on your Nuvio account dashboard.</td>
       </tr>
       <tr>
+        <td>Title &amp; poster resolution</td>
+        <td>Not done by us. The rows return bare references and <b>your own installed meta addons</b> (Cinemeta, TMDB, AIOStreams&hellip;) resolve titles and posters &mdash; the same way they do for every other addon. That is why this Worker only ever talks to <code>api.nuvio.tv</code> and <code>api.strem.io</code>.</td>
+      </tr>
+      <tr>
         <td>Stremio account write-back <span style="opacity:.6">(when linked)</span></td>
         <td>Writes <code>libraryItem.state.timeOffset</code> into your Stremio account via Stremio's own API &mdash; the only way Nuvio progress can actually <b>resume</b> in Stremio. Skipping the link leaves this as a display-only row.</td>
       </tr>
