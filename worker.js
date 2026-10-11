@@ -1090,7 +1090,7 @@ async function pullLibraryMeta(cfg, token, profileId, stremioKey) {
 
   const map = new Map();
 
-  // 1. Nuvio library (the user's own adds - carries names and posters).
+  // 1a. Nuvio library (the user's own adds - carries names and posters).
   if (token) {
     try {
       const rows = await nuvioRpc(cfg, token, 'sync_pull_library', {
@@ -1100,6 +1100,19 @@ async function pullLibraryMeta(cfg, token, profileId, stremioKey) {
       harvestLibraryMeta(rows, map);
     } catch {
       /* library is optional */
+    }
+
+    // 1b. Nuvio watch history - rows here carry titles even when the title was
+    // never added to the library, which is the most common case for things
+    // watched only inside Nuvio.
+    try {
+      const rows = await nuvioRpc(cfg, token, 'sync_pull_watched_items', {
+        p_profile_id: profileId,
+        p_limit: 500,
+      });
+      harvestLibraryMeta(rows, map);
+    } catch {
+      /* history is optional */
     }
   }
 
@@ -1127,6 +1140,38 @@ async function pullLibraryMeta(cfg, token, profileId, stremioKey) {
   libraryMetaCache.set(key, { expires: Date.now() + LIBRARY_META_TTL_MS, value: map });
   console.log(`[meta] library join built: ${map.size} titled ids`);
   return map;
+}
+
+// ---------------------------------------------------------------------------
+// AUTOMATIC SYNC (triggered by the manifest request)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pull the user's Nuvio progress and write it into their Stremio account.
+ *
+ * Called when either app requests the manifest - i.e. on app open and on the
+ * clients' periodic addon refresh - so Nuvio -> Stremio resume happens without
+ * the user having to open any particular row.
+ *
+ * Bounded and defensive: the manifest is latency-sensitive, so this is capped
+ * at one progress pull + STREMIO_WRITE_BATCH writes, and every failure is
+ * swallowed (a sync problem must never break addon installation).
+ */
+async function autoSyncFromManifest(cfg, token, profileId, stremioKey) {
+  try {
+    const metaMap = await pullLibraryMeta(cfg, token, profileId, stremioKey);
+    let rows = [];
+    try {
+      rows = await pullProgress(cfg, token, profileId, CATALOG_LIMIT);
+    } catch (err) {
+      console.error(`[auto-sync] progress pull failed: ${err.message}`);
+      return;
+    }
+    const { written } = await syncProgressToStremio(cfg, stremioKey, rows, metaMap);
+    console.log(`[auto-sync] manifest-triggered sync complete: ${written} resume point(s) written`);
+  } catch (err) {
+    console.error(`[auto-sync] failed: ${err.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,7 +1288,16 @@ export default {
       const head = rest[0];
 
       // ---- manifest ------------------------------------------------------
+      // Both apps fetch the manifest on open (and periodically). For a linked
+      // install we use it as the automatic sync point: Nuvio progress is
+      // pulled and written into the Stremio account BEFORE the response is
+      // returned, so by the time the client renders its boards and pulls its
+      // library, the resume points are already there. Without this, the only
+      // trigger was the user manually opening the Continue Watching row.
       if (!head || head === 'manifest.json' || head.startsWith('manifest.json?')) {
+        if (token && stremioKey) {
+          await autoSyncFromManifest(cfg, token, profileId, stremioKey);
+        }
         return json(buildManifest());
       }
 
