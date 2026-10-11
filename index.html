@@ -4,403 +4,502 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Stremio &harr; Nuvio Live Sync</title>
-<meta name="description" content="Free, stateless addon that bridges live playback position between Stremio and Nuvio." />
+<meta name="description" content="Free, stateless bridge that syncs live playback position and watched-state between Stremio and Nuvio. One addon URL, installed in both apps." />
+<meta name="color-scheme" content="dark" />
 
 <!--
   ============================================================================
-  Stremio <-> Nuvio Live Sync  ·  GitHub Pages frontend (single file)
+  Stremio <-> Nuvio Live Sync  ·  frontend (served by the Cloudflare Worker)
   ============================================================================
-  This page does three things and nothing else:
+  What this page does, and all it does:
 
-    1. collects the user's Nuvio access token (kept in this browser only,
-       optionally in localStorage for convenience - NEVER transmitted
-       anywhere except inside the addon URL the user installs themselves),
-    2. builds the addon manifest URL of the form
-           https://<worker>/t/<nuvioToken>@<profile>/manifest.json
-       and shows install links + a QR code for TV devices,
-    3. verifies the token against the Worker's /health endpoint, which
-       calls Nuvio's sync_pull_profiles.
+    1. Signs the user in to Nuvio (email + password, exchanged by the Worker
+       against api.nuvio.tv - the password is never stored, never logged).
+    2. Optionally links their Stremio account (authKey) so that Nuvio progress
+       actually RESUMES inside Stremio, not just displays.
+    3. Builds ONE addon URL containing both credentials in its path:
+           https://<worker>/t/<nuvioToken>@<profile>/s/<stremioKey>/manifest.json
+       The same URL is installed in Stremio AND Nuvio.
 
-  It performs no sync itself. All syncing happens in the Cloudflare Worker
-  (worker.js) that the generated URL points at - this page is a pure
-  static site with zero backend.
+  No database, no accounts, no tracking, no third-party requests of any kind:
+  the page only ever talks to its own Worker.
   ============================================================================
 -->
 
 <style>
   :root {
-    --bg: #0a0a0f;
-    --bg-card: #12121a;
-    --bg-card-2: #1a1a26;
-    --border: #262636;
-    --text: #e8e8f0;
-    --text-dim: #9a9ab0;
-    --accent: #8b5cf6;          /* Stremio-ish purple */
+    --bg: #07070b;
+    --bg-grad-1: #12101f;
+    --bg-grad-2: #0a0a12;
+    --surface: rgba(255, 255, 255, 0.028);
+    --surface-2: rgba(255, 255, 255, 0.05);
+    --border: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.14);
+    --text: #f2f2f7;
+    --text-dim: #9a9ab4;
+    --text-faint: #6a6a85;
+    --accent: #8b5cf6;
     --accent-2: #6366f1;
+    --accent-soft: rgba(139, 92, 246, 0.14);
     --ok: #34d399;
+    --ok-soft: rgba(52, 211, 153, 0.12);
     --err: #f87171;
-    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --err-soft: rgba(248, 113, 113, 0.12);
+    --radius: 16px;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   }
 
   * { box-sizing: border-box; }
 
+  html { -webkit-text-size-adjust: 100%; }
+
   body {
     margin: 0;
-    background: var(--bg);
+    min-height: 100vh;
+    background:
+      radial-gradient(1100px 600px at 50% -180px, var(--bg-grad-1), transparent 70%),
+      radial-gradient(900px 500px at 85% 110%, rgba(99, 102, 241, 0.07), transparent 70%),
+      var(--bg);
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
     line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
   }
 
-  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 56px 20px 72px; }
 
-  header { text-align: center; margin-bottom: 36px; }
-  header h1 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.02em; }
+  /* ---------------- header ---------------- */
+  header { text-align: center; margin-bottom: 40px; }
+
+  .mark {
+    width: 64px; height: 64px; margin: 0 auto 20px;
+    border-radius: 18px;
+    background: linear-gradient(140deg, var(--accent), var(--accent-2));
+    display: grid; place-items: center;
+    box-shadow: 0 12px 40px -12px rgba(139, 92, 246, 0.65),
+                inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+  .mark svg { width: 32px; height: 32px; }
+
+  header h1 {
+    font-size: clamp(26px, 5vw, 34px);
+    margin: 0 0 10px;
+    letter-spacing: -0.03em;
+    font-weight: 700;
+  }
   header h1 .grad {
-    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    background: linear-gradient(92deg, #c4b5fd, #8b5cf6 45%, #6366f1);
     -webkit-background-clip: text; background-clip: text; color: transparent;
   }
-  header p { color: var(--text-dim); margin: 0; font-size: 15px; }
+  header p {
+    color: var(--text-dim); margin: 0 auto; max-width: 46ch;
+    font-size: 15.5px;
+  }
 
+  /* ---------------- cards ---------------- */
   .card {
-    background: var(--bg-card);
+    background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 22px;
-    margin-bottom: 22px;
+    border-radius: var(--radius);
+    padding: 26px;
+    margin-bottom: 18px;
+    backdrop-filter: blur(6px);
   }
-  .card h2 {
-    margin: 0 0 4px; font-size: 17px; display: flex; align-items: center; gap: 10px;
-  }
-  .card h2 .num {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 24px; height: 24px; border-radius: 50%;
-    background: linear-gradient(135deg, var(--accent), var(--accent-2));
-    font-size: 13px; font-weight: 700; color: #fff; flex: none;
-  }
-  .card .sub { color: var(--text-dim); font-size: 13.5px; margin: 0 0 16px; }
+  .card.hidden { display: none; }
 
-  label { display: block; font-size: 13px; color: var(--text-dim); margin: 14px 0 6px; }
-  input[type="text"], input[type="number"] {
-    width: 100%; padding: 11px 13px; border-radius: 9px;
-    border: 1px solid var(--border); background: var(--bg-card-2);
-    color: var(--text); font-size: 14px; font-family: var(--mono);
-    outline: none; transition: border-color .15s;
+  .step-head { display: flex; align-items: center; gap: 13px; margin-bottom: 6px; }
+  .step-num {
+    flex: none;
+    width: 27px; height: 27px; border-radius: 50%;
+    background: var(--accent-soft);
+    border: 1px solid rgba(139, 92, 246, 0.35);
+    color: #c4b5fd;
+    font-size: 13px; font-weight: 700;
+    display: grid; place-items: center;
   }
-  input:focus { border-color: var(--accent); }
+  .step-head h2 { margin: 0; font-size: 16.5px; font-weight: 650; letter-spacing: -0.01em; }
+  .step-head .optional {
+    font-size: 11.5px; font-weight: 600; letter-spacing: .04em;
+    color: var(--text-faint); text-transform: uppercase;
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px;
+  }
+  .card .sub { color: var(--text-dim); font-size: 13.5px; margin: 0 0 20px; }
+
+  /* ---------------- forms ---------------- */
+  label { display: block; font-size: 12.5px; font-weight: 550; color: var(--text-dim); margin: 0 0 7px; }
+
+  input[type="text"], input[type="email"], input[type="password"], input[type="number"] {
+    width: 100%; padding: 12px 14px;
+    border-radius: 11px;
+    border: 1px solid var(--border);
+    background: rgba(0, 0, 0, 0.28);
+    color: var(--text);
+    font-size: 14.5px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color .15s, box-shadow .15s, background .15s;
+  }
+  input.mono { font-family: var(--mono); font-size: 13.5px; }
+  input::placeholder { color: var(--text-faint); }
+  input:focus {
+    border-color: rgba(139, 92, 246, 0.6);
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.14);
+    background: rgba(0, 0, 0, 0.4);
+  }
+  input[type="number"] { text-align: center; }
+
   .row { display: flex; gap: 12px; flex-wrap: wrap; }
-  .row > div { flex: 1 1 220px; }
+  .row > .field { flex: 1 1 200px; min-width: 0; }
+  .row > .field.tiny { flex: 0 0 92px; }
 
+  .field { margin-bottom: 16px; }
+
+  /* ---------------- buttons ---------------- */
   button {
-    cursor: pointer; border: none; border-radius: 9px; font-size: 14px;
-    font-weight: 600; padding: 11px 18px; transition: filter .15s, transform .05s;
+    cursor: pointer; border: none; border-radius: 11px;
+    font-size: 14px; font-weight: 600; font-family: inherit;
+    padding: 12px 20px;
+    transition: filter .15s, transform .06s, border-color .15s, background .15s;
   }
   button:active { transform: translateY(1px); }
-  .btn-primary {
-    background: linear-gradient(90deg, var(--accent), var(--accent-2)); color: #fff;
-  }
-  .btn-primary:hover { filter: brightness(1.12); }
-  .btn-ghost {
-    background: var(--bg-card-2); color: var(--text); border: 1px solid var(--border);
-  }
-  .btn-ghost:hover { border-color: var(--accent); }
-  .btn-ghost:disabled, .btn-primary:disabled { opacity: .5; cursor: default; }
+  button:disabled { opacity: .55; cursor: default; }
 
-  .urlbox {
-    margin-top: 16px; display: none;
+  .btn-primary {
+    background: linear-gradient(92deg, var(--accent), var(--accent-2));
+    color: #fff;
+    box-shadow: 0 8px 24px -10px rgba(139, 92, 246, 0.7);
   }
-  .urlbox.show { display: block; }
-  .urlbox .field { display: flex; gap: 8px; }
-  .urlbox input { flex: 1; }
-  .hint { font-size: 12.5px; color: var(--text-dim); margin-top: 8px; }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.12); }
+
+  .btn-ghost {
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-ghost:hover:not(:disabled) { border-color: var(--border-strong); background: rgba(255, 255, 255, 0.08); }
+
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+
+  /* ---------------- status banners ---------------- */
+  .status { display: none; margin-top: 14px; font-size: 13.5px; border-radius: 11px; padding: 11px 14px; border: 1px solid transparent; }
+  .status.show { display: block; }
+  .status.ok { color: var(--ok); background: var(--ok-soft); border-color: rgba(52, 211, 153, 0.25); }
+  .status.err { color: var(--err); background: var(--err-soft); border-color: rgba(248, 113, 113, 0.25); }
+  .status.info { color: var(--text-dim); background: var(--surface-2); border-color: var(--border); }
+
+  /* ---------------- url panel ---------------- */
+  .panel {
+    margin-top: 20px; padding: 18px;
+    border-radius: 13px;
+    background: linear-gradient(180deg, rgba(139, 92, 246, 0.09), rgba(139, 92, 246, 0.03));
+    border: 1px solid rgba(139, 92, 246, 0.22);
+  }
+  .panel .field { display: flex; gap: 8px; }
+  .panel input { flex: 1; min-width: 0; }
+
+  .qr-area { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+  #qrcode { background: #fff; padding: 9px; border-radius: 11px; display: none; line-height: 0; }
+  #qrcode.show { display: block; }
+  .qr-note { font-size: 12.5px; color: var(--text-dim); max-width: 30ch; }
+
+  .hint { font-size: 12.5px; color: var(--text-faint); margin: 10px 0 0; }
   .hint.warn { color: #fbbf24; }
 
-  .status { margin-top: 10px; font-size: 13.5px; display: none; }
-  .status.show { display: block; }
-  .status.ok { color: var(--ok); }
-  .status.err { color: var(--err); }
+  a.link { color: #a78bfa; text-decoration: none; font-weight: 550; }
+  a.link:hover { text-decoration: underline; }
 
-  .steps { margin: 0; padding-left: 0; list-style: none; counter-reset: step; }
-  .steps li {
-    counter-increment: step; position: relative; padding-left: 34px;
-    margin-bottom: 14px; font-size: 14px;
+  /* ---------------- install cards ---------------- */
+  .install-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 18px; }
+  .install {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 13px;
+    padding: 16px;
   }
-  .steps li::before {
-    content: counter(step); position: absolute; left: 0; top: 1px;
-    width: 22px; height: 22px; border-radius: 50%;
-    background: var(--bg-card-2); border: 1px solid var(--border);
-    color: var(--accent); font-size: 12px; font-weight: 700;
-    display: flex; align-items: center; justify-content: center;
-  }
-  .steps b { color: var(--text); }
-  .steps code, .inline-code {
-    background: var(--bg-card-2); border: 1px solid var(--border);
-    border-radius: 5px; padding: 1px 6px; font-size: 12.5px; font-family: var(--mono);
-    color: var(--accent);
+  .install h3 { margin: 0 0 6px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .install p { margin: 0; font-size: 12.8px; color: var(--text-dim); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+
+  code, .inline-code {
+    font-family: var(--mono); font-size: 12.3px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid var(--border);
+    border-radius: 6px; padding: 1.5px 6px; color: #c4b5fd;
   }
 
-  .qr-area { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
-  #qrcode {
-    background: #fff; padding: 10px; border-radius: 10px; display: none;
-  }
-  #qrcode.show { display: block; }
-  #qrcode img, #qrcode canvas { display: block; }
-
+  /* ---------------- details / how it works ---------------- */
   details {
-    background: var(--bg-card); border: 1px solid var(--border);
-    border-radius: 14px; padding: 16px 22px; margin-bottom: 22px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 18px;
+    overflow: hidden;
   }
-  summary { cursor: pointer; font-weight: 600; font-size: 15px; }
-  details[open] summary { margin-bottom: 12px; }
-  details p, details li { font-size: 13.5px; color: var(--text-dim); }
-  details ul { padding-left: 20px; margin: 8px 0; }
+  summary {
+    cursor: pointer; list-style: none;
+    padding: 18px 22px;
+    font-size: 14.5px; font-weight: 600;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::after {
+    content: ""; width: 8px; height: 8px;
+    border-right: 1.6px solid var(--text-faint); border-bottom: 1.6px solid var(--text-faint);
+    transform: rotate(45deg); transition: transform .2s;
+  }
+  details[open] summary::after { transform: rotate(-135deg); }
+  .details-body { padding: 0 22px 22px; }
+  .details-body p, .details-body li { font-size: 13.2px; color: var(--text-dim); }
+  .details-body ul { padding-left: 20px; margin: 8px 0; }
 
-  table.spec { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
-  table.spec th, table.spec td {
-    text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border);
-    vertical-align: top;
-  }
-  table.spec th { color: var(--text-dim); font-weight: 600; }
-  table.spec td code { font-family: var(--mono); color: var(--accent); font-size: 12px; }
+  table.spec { width: 100%; border-collapse: collapse; font-size: 12.6px; margin-top: 12px; }
+  table.spec th, table.spec td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.spec th { color: var(--text-faint); font-weight: 600; white-space: nowrap; }
+  table.spec tr:last-child td { border-bottom: none; }
 
-  footer {
-    text-align: center; color: var(--text-dim); font-size: 12.5px; margin-top: 8px;
+  /* ---------------- footer ---------------- */
+  footer { text-align: center; color: var(--text-faint); font-size: 12.5px; margin-top: 28px; }
+  footer .sep { margin: 0 8px; opacity: .5; }
+
+  @media (max-width: 560px) {
+    .wrap { padding: 36px 16px 56px; }
+    .card { padding: 20px; }
+    .card .sub { margin-bottom: 16px; }
   }
-  footer a { color: var(--accent); text-decoration: none; }
 </style>
 </head>
 <body>
 <div class="wrap">
 
   <header>
+    <div class="mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+        <path d="M21 3v6h-6" />
+        <path d="M12 7v5l3 2" />
+      </svg>
+    </div>
     <h1><span class="grad">Stremio &harr; Nuvio</span> Live Sync</h1>
-    <p>Free &amp; stateless. Sync live playback position and watched-state between
-       Stremio and Nuvio &mdash; one addon URL, installed in both apps.</p>
+    <p>Watch in one app, resume in the other &mdash; at the exact position. One addon link,
+       installed in both. Nothing is ever stored.</p>
   </header>
 
-  <!-- ================= STEP 1: connect ================= -->
+  <!-- ==================== STEP 1: Nuvio ==================== -->
   <section class="card">
-    <h2><span class="num">1</span> Sign in to Nuvio</h2>
-    <p class="sub">The same login you use in the Nuvio app. Your password is sent to
-       this Worker only to exchange it for a Nuvio token &mdash; it is never stored,
-       never logged, and the token stays in your browser.</p>
+    <div class="step-head">
+      <span class="step-num">1</span>
+      <h2>Sign in to Nuvio</h2>
+    </div>
+    <p class="sub">The same login you use in the Nuvio app. It is exchanged for a token and
+       discarded immediately &mdash; never stored, never logged.</p>
 
     <div class="row">
-      <div>
+      <div class="field">
         <label for="email">Nuvio email</label>
         <input id="email" type="email" placeholder="you@example.com" autocomplete="username" spellcheck="false" />
       </div>
-      <div>
-        <label for="password">Password</label>
-        <input id="password" type="password" placeholder="your Nuvio password" autocomplete="current-password" />
-      </div>
-      <div style="flex:0 0 110px">
-        <label for="profile">Profile #</label>
-        <input id="profile" type="number" min="1" max="6" step="1" value="1" />
+      <div class="field tiny">
+        <label for="profile">Profile</label>
+        <input id="profile" type="number" min="1" max="6" step="1" value="1" title="Nuvio profile number (1-6)" />
       </div>
     </div>
 
-    <div class="row" style="margin-top:16px">
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" type="password" placeholder="Your Nuvio password" autocomplete="current-password" />
+    </div>
+
+    <div class="btn-row">
       <button id="signin" class="btn-primary">Sign in</button>
       <button id="reset" class="btn-ghost" type="button">Clear saved</button>
     </div>
 
     <div id="signinStatus" class="status"></div>
+
     <div id="signedInAs" class="status" style="display:none">
-      Signed in &mdash; <button id="generate" class="btn-primary" style="margin-left:8px">Generate add-on URL</button>
+      <button id="generate" class="btn-primary">Generate add-on link</button>
     </div>
+  </section>
 
-    <!-- ============ STEP 1b: link Stremio (optional but recommended) ============ -->
-    <div id="stremioLink" style="display:none;margin-top:18px;border-top:1px solid var(--border);padding-top:16px">
-      <h2 style="font-size:15px;margin:0 0 4px">Link your Stremio account <span style="color:var(--text-dim);font-weight:400">(optional)</span></h2>
-      <p class="sub">Makes what you watch in <b>Nuvio</b> resume at the right spot in <b>Stremio</b>.
-         Without this, Stremio can show your Nuvio progress but always starts from zero.
-         Same rules: exchanged once, never stored, nothing logged.</p>
-      <div class="row">
-        <div>
-          <label for="stremioEmail">Stremio email</label>
-          <input id="stremioEmail" type="email" placeholder="you@example.com" autocomplete="username" spellcheck="false" />
-        </div>
-        <div>
-          <label for="stremioPassword">Stremio password</label>
-          <input id="stremioPassword" type="password" placeholder="your Stremio password" autocomplete="current-password" />
-        </div>
-      </div>
-      <div class="row" style="margin-top:14px">
-        <button id="stremioSignin" class="btn-ghost">Link Stremio</button>
-        <button id="skipStremio" class="btn-ghost" type="button">Skip &mdash; Nuvio only</button>
-      </div>
-      <div id="stremioStatus" class="status"></div>
+  <!-- ==================== STEP 2: Stremio (optional) ==================== -->
+  <section class="card hidden" id="stremioLink">
+    <div class="step-head">
+      <span class="step-num">2</span>
+      <h2>Link Stremio</h2>
+      <span class="optional">optional</span>
     </div>
+    <p class="sub">Makes what you watch in <b>Nuvio</b> resume at the right place inside
+       <b>Stremio</b>. Without it, Stremio can still show your Nuvio progress &mdash;
+       but always starts from zero. Same rules: exchanged once, never stored.</p>
 
-    <details style="margin-top:14px;background:none;border:none;padding:0">
-      <summary style="font-size:13px;color:var(--text-dim)">Advanced: paste an access token instead</summary>
-      <div style="margin-top:10px">
-        <input id="token" type="text" placeholder="paste a Nuvio access token" autocomplete="off" spellcheck="false" />
-        <button id="useToken" class="btn-ghost" style="margin-top:8px">Use this token</button>
-      </div>
-    </details>
-
-    <div id="urlbox" class="urlbox">
-      <label>Your personal add-on URL &mdash; install this in both Stremio and Nuvio</label>
+    <div class="row">
       <div class="field">
-        <input id="addonUrl" type="text" readonly />
+        <label for="stremioEmail">Stremio email</label>
+        <input id="stremioEmail" type="email" placeholder="you@example.com" autocomplete="username" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label for="stremioPassword">Stremio password</label>
+        <input id="stremioPassword" type="password" placeholder="Your Stremio password" autocomplete="current-password" />
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button id="stremioSignin" class="btn-primary">Link Stremio</button>
+      <button id="skipStremio" class="btn-ghost" type="button">Skip &mdash; Nuvio only</button>
+    </div>
+
+    <div id="stremioStatus" class="status"></div>
+  </section>
+
+  <!-- ==================== STEP 3: install ==================== -->
+  <section class="card hidden" id="installCard">
+    <div class="step-head">
+      <span class="step-num">3</span>
+      <h2>Install in both apps</h2>
+    </div>
+    <p class="sub">The same link works in Stremio and Nuvio &mdash; both speak the Stremio addon protocol.</p>
+
+    <div class="panel">
+      <label for="addonUrl">Your add-on link</label>
+      <div class="field">
+        <input id="addonUrl" type="text" class="mono" readonly />
         <button id="copy" class="btn-ghost">Copy</button>
       </div>
-      <p class="hint">
-        The token lives in the URL path &mdash; that is the whole &ldquo;login&rdquo; system.
-        Treat this URL like a password: it grants access to your Nuvio progress.
-      </p>
-      <p style="margin-top:12px">
-        <a id="debugLink" href="#" target="_blank" rel="noopener"
-           style="color:var(--accent);font-size:13.5px;text-decoration:none">Run sync self-check &rarr;</a>
-        <span class="hint" style="display:block;margin-top:4px">
-          Checks both logins, counts your Continue Watching items, shows what will be
-          written next and lists the playback events this Worker has seen. No terminal, no logs.
-        </span>
-      </p>
+      <p class="hint">This link carries your credentials. Treat it like a password &mdash;
+         anyone with it can read and write your Nuvio progress.</p>
+
+      <div class="qr-area">
+        <div id="qrcode" title="Scan with Nuvio TV: Manage from phone"></div>
+        <p class="qr-note">Scan with <b>Nuvio TV</b> &rarr; <i>Manage from phone</i>,
+           or copy the link on your phone and open this page there.</p>
+      </div>
+
+      <div class="btn-row" style="margin-top:16px">
+        <a id="debugLink" href="#" target="_blank" rel="noopener" class="link">Run sync self-check &rarr;</a>
+      </div>
+      <p class="hint">Verifies both logins, counts your Continue Watching items, shows what
+         will sync next, and lists the playback events seen so far.</p>
     </div>
-  </section>
 
-  <!-- ================= STEP 2: install ================= -->
-  <section class="card" id="installCard" style="display:none">
-    <h2><span class="num">2</span> Install in your apps</h2>
-    <p class="sub">The same URL works in Stremio and Nuvio &mdash; both speak the Stremio addon protocol.</p>
-
-    <div class="qr-area">
-      <div id="qrcode" title="Scan with Nuvio TV &rarr; Manage from phone"></div>
-      <div>
-        <p style="margin:0 0 6px;font-size:14px"><b>Nuvio TV:</b> Addons &rarr; <i>Manage from phone</i> &rarr; scan this QR code</p>
-        <p style="margin:0;font-size:13px;color:var(--text-dim)">Phones can also open this page and copy the URL.</p>
+    <div class="install-grid">
+      <div class="install">
+        <h3><span class="dot"></span>Stremio</h3>
+        <p>Add-ons &rarr; paste the link &rarr; Install. Use the <b>same profile number</b> you use on your other device.</p>
+      </div>
+      <div class="install">
+        <h3><span class="dot"></span>Nuvio (mobile / desktop)</h3>
+        <p>Settings &rarr; Content &amp; Discovery &rarr; Addons &rarr; paste the link &rarr; Install.</p>
+      </div>
+      <div class="install">
+        <h3><span class="dot"></span>Nuvio TV</h3>
+        <p>Addons &rarr; <i>Manage from phone</i> &rarr; scan the QR code above.</p>
+      </div>
+      <div class="install">
+        <h3><span class="dot"></span>Then</h3>
+        <p>Watch anything in either app and open the other &mdash; it resumes at the exact position.</p>
       </div>
     </div>
-
-    <ol class="steps" style="margin-top:20px">
-      <li><b>Stremio (Desktop / Web / Android / TV):</b>
-        open <code>Addons</code> &rarr; paste the URL above &rarr; Install.
-        You should see two new rows: <i>Continue Watching (Nuvio)</i> and
-        <i>Watched (Nuvio)</i>.</li>
-      <li><b>Nuvio (Android / TV / Desktop):</b>
-        <code>Settings &rarr; Content &amp; Discovery &rarr; Addons</code> &rarr;
-        paste the same URL into <i>Add Addon</i> &rarr; Install.</li>
-      <li><b>Watch something in Stremio.</b> Start, pause, seek and close events are
-        pushed to your Nuvio account within seconds. Open Nuvio&rsquo;s
-        <i>Continue Watching</i> &mdash; the movie is there with its position.</li>
-      <li><b>Watch something in Nuvio</b> (or on another device) &rarr; open Stremio&rsquo;s
-        <i>Continue Watching (Nuvio)</i> row &rarr; it <b>resumes at the same position</b>
-        (requires the linked Stremio account above).</li>
-      <li><b>Watch something in Nuvio</b> (if your client also emits player events),
-        then open Stremio&rsquo;s <i>Continue Watching (Nuvio)</i> row to resume.</li>
-    </ol>
   </section>
 
-  <!-- ================= how it works ================= -->
   <details>
-    <summary>How it works (and how to verify it is syncing)</summary>
+    <summary>How it works</summary>
+    <div class="details-body">
+      <p>The addon is a stateless Cloudflare Worker. It speaks the Stremio addon protocol
+         and uses your two accounts as its only &ldquo;database&rdquo; &mdash; reading and writing
+         each side directly through their own APIs.</p>
 
-    <p>The addon is a stateless Cloudflare Worker. It declares the Stremio protocol&rsquo;s
-    <b>event resources</b>, which is the part most addons never use: instead of serving
-    content, the addon <i>receives</i> your activity.</p>
+      <table class="spec">
+        <tr><th>When</th><th>What happens</th></tr>
+        <tr>
+          <td>You open either app</td>
+          <td>The app fetches the manifest; the Worker syncs both directions immediately &mdash; no need to open any particular row.</td>
+        </tr>
+        <tr>
+          <td><code>/player/...</code> events</td>
+          <td>Start, pause, seek and stop (including abrupt app exit) carry the exact position in ms and are pushed to Nuvio and written into your Stremio library.</td>
+        </tr>
+        <tr>
+          <td>Stremio &rarr; Nuvio</td>
+          <td>Positions are read from your Stremio account (<code>libraryItem.state.timeOffset</code>) and pushed to Nuvio &mdash; this works even if your Stremio build never emits player events.</td>
+        </tr>
+        <tr>
+          <td>Nuvio &rarr; Stremio</td>
+          <td>Progress is written into your Stremio account as library items with <code>state.timeOffset</code>, which is what Stremio's own Continue Watching reads to resume.</td>
+        </tr>
+        <tr>
+          <td>Rows in Stremio</td>
+          <td><i>Continue Watching (Nuvio)</i> and <i>Watched (Nuvio)</i> are populated from your Nuvio account; titles and posters come from your own libraries.</td>
+        </tr>
+        <tr>
+          <td>Watched marks</td>
+          <td>Marking watched in either app writes to the other's history.</td>
+        </tr>
+      </table>
 
-    <table class="spec">
-      <tr><th>Stremio sends</th><th>Worker does</th></tr>
-      <tr>
-        <td><code>/player/movie/tt0137523/action=start&amp;currentTime=0&amp;duration=7200000.json</code></td>
-        <td>Parses <code>action</code>, <code>currentTime</code> (ms), <code>duration</code> (ms) from the path, then POSTs to <code>sync_push_watch_progress</code>.</td>
-      </tr>
-      <tr>
-        <td><code>.../action=pause&amp;currentTime=1830000&amp;duration=7200000.json</code></td>
-        <td>Pushes position 1&thinsp;830&thinsp;000&nbsp;ms (30:30) to Nuvio &mdash; that is your resume point.</td>
-      </tr>
-      <tr>
-        <td><code>.../action=stop&amp;currentTime=6900000&amp;duration=7200000.json</code></td>
-        <td>Fires even when the player closes or the app exits abruptly. Pushes the final position; Nuvio auto-marks watched at &ge;90%.</td>
-      </tr>
-      <tr>
-        <td><code>/library/movie/tt0137523/action=watched.json</code></td>
-        <td>Pushes a watched-history item to Nuvio.</td>
-      </tr>
-      <tr>
-        <td><code>/catalog/movie/nuviocw.json</code> (you opening Stremio)</td>
-        <td>Pulls your Nuvio progress and renders the <i>Continue Watching (Nuvio)</i> row.</td>
-      </tr>
-      <tr>
-        <td><code>/catalog/movie/nuviowatched.json</code></td>
-        <td>Pulls your Nuvio watch history and renders the <i>Watched (Nuvio)</i> row &mdash; the same list as the <i>Watched</i> tab on your Nuvio account dashboard.</td>
-      </tr>
-      <tr>
-        <td>Title &amp; poster resolution</td>
-        <td>Not done by us. The rows return bare references and <b>your own installed meta addons</b> (Cinemeta, TMDB, AIOStreams&hellip;) resolve titles and posters &mdash; the same way they do for every other addon. That is why this Worker only ever talks to <code>api.nuvio.tv</code> and <code>api.strem.io</code>.</td>
-      </tr>
-      <tr>
-        <td>Stremio account write-back <span style="opacity:.6">(when linked)</span></td>
-        <td>Writes <code>libraryItem.state.timeOffset</code> into your Stremio account via Stremio's own API &mdash; the only way Nuvio progress can actually <b>resume</b> in Stremio. Skipping the link leaves this as a display-only row.</td>
-      </tr>
-    </table>
+      <p style="margin-top:16px"><b>Privacy:</b> nothing is stored anywhere &mdash; no database,
+         no accounts, no analytics, no logs of your credentials or tokens. Every request reads
+         the credentials from its own URL, uses them for one call to Nuvio's or Stremio's API,
+         and discards them. Revoke access instantly by uninstalling the addon in both apps.</p>
+    </div>
+  </details>
 
-    <p style="margin-top:14px"><b>Verify it works:</b> the addon operator can run
-    <code>npx wrangler tail</code> (or open the Worker&rsquo;s Logs in the Cloudflare dashboard)
-    &mdash; every <code>[player]</code> line shows the parsed action, position and duration
-    arriving live during playback.</p>
-
-    <p><b>Note:</b> player events are a recent protocol addition. If your Stremio build does
-    not send them yet, you will see no <code>[player]</code> lines in the logs &mdash; in that
-    case only the catalog row (Nuvio&rarr;Stremio resume) and watched toggles sync.
-    Updating Stremio/Nuvio to the latest version is the fix.</p>
-
-    <p><b>Privacy:</b> no server stores anything. Your token is read from the URL on each
-    request, used for one call to Nuvio&rsquo;s API, and discarded. You can revoke access
-    instantly by regenerating your token or uninstalling the addon in both apps.</p>
+  <details>
+    <summary>Advanced: paste a token instead</summary>
+    <div class="details-body">
+      <p>If you already have a Nuvio access token, use it directly instead of signing in.</p>
+      <div class="field">
+        <input id="token" type="text" class="mono" placeholder="Nuvio access token" autocomplete="off" spellcheck="false" />
+      </div>
+      <button id="useToken" class="btn-ghost">Use this token</button>
+    </div>
   </details>
 
   <footer>
-    100% free &amp; open &middot; GitHub Pages + Cloudflare Workers &middot;
-    no database, no accounts, no tracking
+    100% free &amp; open<span class="sep">·</span>Cloudflare Workers<span class="sep">·</span>no database<span class="sep">·</span>no accounts<span class="sep">·</span>no tracking
   </footer>
 </div>
 
-<!-- QR code generator (CDN, optional enhancement - page works without it) -->
+<!-- QR codes for TV installs (optional; the page works without it) -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 
 <script>
 (function () {
   "use strict";
 
-  // ---- Element handles -----------------------------------------------------
+  // ---- Elements ------------------------------------------------------------
   var $ = function (id) { return document.getElementById(id); };
   var emailInput = $("email");
   var passwordInput = $("password");
   var profileInput = $("profile");
   var tokenInput = $("token");
-
-  /**
-   * The deployed Cloudflare Worker. Hardcoded so users never see or type a
-   * backend URL - the page only asks for their Nuvio credentials.
-   * If the Worker is ever redeployed to a new address, change this one line.
-   */
-  var WORKER_URL = "https://numio-sync.vijaykumar-f83.workers.dev";
   var signinBtn = $("signin");
   var useTokenBtn = $("useToken");
   var resetBtn = $("reset");
   var signinStatus = $("signinStatus");
   var signedInAs = $("signedInAs");
   var generateBtn = $("generate");
-  var urlBox = $("urlbox");
+  var urlBox = $("installCard");
   var addonUrlInput = $("addonUrl");
   var copyBtn = $("copy");
-  var installCard = $("installCard");
   var qrHost = $("qrcode");
+  var debugLink = $("debugLink");
 
   var LS_KEY = "nuvio-sync-prefs";
 
   /**
-   * Credentials, held in memory only.
-   * Deliberately NOT written to localStorage: they are bearer credentials
-   * (the Nuvio token lives ~1 hour), so persisting them buys nothing and
-   * costs exposure.
+   * The deployed Worker. Hardcoded so users never see or type a backend URL -
+   * the page only ever asks for their credentials. If the Worker is ever
+   * redeployed to a new address, change this one line.
    */
-  var accessToken = null;      // Nuvio access token
-  var stremioKey = null;       // Stremio authKey (optional - enables resume)
+  var WORKER_URL = "https://numio-sync.vijaykumar-f83.workers.dev";
+
+  /**
+   * Credentials, held in memory only. Deliberately NOT written to
+   * localStorage: they are bearer credentials (the Nuvio token lives ~1 hour),
+   * so persisting them buys nothing and costs exposure.
+   */
+  var accessToken = null;   // Nuvio access token
+  var stremioKey = null;    // Stremio authKey (optional - enables resume)
 
   // ---- Persistence (this browser only, for convenience) --------------------
   function loadPrefs() {
@@ -413,26 +512,21 @@
   }
   function savePrefs() {
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify({
-        profile: profileInput.value
-      }));
+      localStorage.setItem(LS_KEY, JSON.stringify({ profile: profileInput.value }));
     } catch (e) { /* storage unavailable - ignore */ }
   }
 
-  // ---- URL building ---------------------------------------------------------
+  // ---- URL building --------------------------------------------------------
   /**
    * Build the addon manifest URL.
    *
-   * Shape:  https://<worker>/t/<accessToken>@<profile>/manifest.json
+   * Shape:  https://<worker>/t/<accessToken>@<profile>[/s/<stremioAuthKey>]/manifest.json
    *
-   * Why the token is in the PATH and not the query string: Stremio's HTTP
-   * transport derives every subsequent resource request from the directory
-   * the manifest was installed from, so the /t/<token>/ prefix is
-   * automatically re-appended to every player/catalog/library request.
-   * Query strings on the manifest URL are NOT preserved by the client.
-   *
-   * encodeURIComponent keeps tokens with unusual characters URL-safe; the
-   * Worker decodes each path segment before using it.
+   * Why the credentials are in the PATH and not the query string: Stremio's
+   * HTTP transport derives every later resource request from the directory
+   * the manifest was installed from, so the /t/<token>/ prefix is re-applied
+   * automatically to every player/catalog/library request. Query strings on
+   * the manifest URL are NOT preserved by the client.
    */
   function buildAddonUrl(token) {
     var profile = parseInt(profileInput.value, 10) || 1;
@@ -442,38 +536,42 @@
     return url + "/manifest.json";
   }
 
-  // ---- Status helper ---------------------------------------------------------
+  // ---- Helpers -------------------------------------------------------------
   function setStatus(el, msg, kind) {
     el.innerHTML = msg;
     el.className = "status show " + (kind || "");
   }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
 
-  // ---- Sign in ---------------------------------------------------------------
+  // ---- Sign in to Nuvio ------------------------------------------------------
   /**
-   * Exchange the user's Nuvio credentials for an access token via the
-   * Worker's /login endpoint:
-   *
+   * Exchange the user's Nuvio credentials for an access token:
    *   POST <worker>/login  { email, password }
    *     -> Worker calls api.nuvio.tv/auth/v1/token?grant_type=password
    *     -> returns ONLY { access_token, expires_in, profiles }
    *
-   * The password is used once and discarded by the Worker; nothing is
-   * stored server-side. The returned token is kept in memory (never in
-   * localStorage) and embedded only in the addon URL the user installs.
+   * The password is used once and discarded by the Worker; nothing is stored
+   * or logged. The returned token is kept in memory (never localStorage) and
+   * embedded only in the addon link the user installs.
    */
   function signIn() {
-    var worker = WORKER_URL;
     var email = emailInput.value.trim();
     var password = passwordInput.value;
-    if (!WORKER_URL) { setStatus(signinStatus, "Worker URL not configured.", "err"); return; }
-    if (!email || !password) { setStatus(signinStatus, "Enter your Nuvio email and password.", "err"); return; }
+    if (!email || !password) {
+      setStatus(signinStatus, "Enter your Nuvio email and password.", "err");
+      return;
+    }
 
     savePrefs();
     signinBtn.disabled = true;
-    setStatus(signinStatus, "Signing in&hellip;", "");
+    setStatus(signinStatus, "Signing in&hellip;", "info");
     passwordInput.value = ""; // never keep the password in the DOM
 
-    fetch(worker + "/login", {
+    fetch(WORKER_URL + "/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email: email, password: password })
@@ -489,40 +587,42 @@
             : null;
           setStatus(signinStatus,
             "Signed in" + (names ? " &mdash; profiles: " + names : "") +
-            ". Token is valid for " + Math.round((r.body.expires_in || 3600) / 60) + " minutes; " +
-            "if syncing stops later, sign in again to refresh it.", "ok");
+            ". The token is valid for about " + Math.round((r.body.expires_in || 3600) / 60) +
+            " minutes; if syncing stops later, sign in again to refresh it.", "ok");
           signedInAs.style.display = "block";
-          document.getElementById("stremioLink").style.display = "block";
+          $("stremioLink").classList.remove("hidden");
+          $("stremioLink").scrollIntoView({ behavior: "smooth", block: "start" });
         } else {
           setStatus(signinStatus, "Sign-in failed" + (r.body && r.body.error ? ": " + escapeHtml(r.body.error) : ""), "err");
         }
       })
       .catch(function () {
-        setStatus(signinStatus, "Could not reach the Worker. Check the URL.", "err");
+        setStatus(signinStatus, "Could not reach the Worker. Check your connection and try again.", "err");
       })
       .then(function () { signinBtn.disabled = false; });
   }
 
+  // ---- Link Stremio ----------------------------------------------------------
   /**
-   * Link the user's Stremio account via the Worker's /stremio-login endpoint:
+   * Link the user's Stremio account:
    *   POST <worker>/stremio-login  { email, password }
    *     -> Worker calls api.strem.io/api/login, validates with getUser
    *     -> returns ONLY { authKey, user }
    *
-   * The authKey is what lets the Worker write resume points into the user's
-   * Stremio library (libraryItem.state.timeOffset). Password is cleared from
-   * the DOM the moment it is sent; neither credential is stored.
+   * The authKey lets the Worker write resume points into the user's Stremio
+   * library (libraryItem.state.timeOffset). The password is cleared from the
+   * DOM the moment it is sent; neither credential is stored.
    */
   function stremioSignIn() {
-    var email = document.getElementById("stremioEmail").value.trim();
-    var password = document.getElementById("stremioPassword").value;
-    var statusEl = document.getElementById("stremioStatus");
+    var email = $("stremioEmail").value.trim();
+    var password = $("stremioPassword").value;
+    var statusEl = $("stremioStatus");
     if (!email || !password) {
       setStatus(statusEl, "Enter your Stremio email and password.", "err");
       return;
     }
-    setStatus(statusEl, "Linking Stremio&hellip;", "");
-    document.getElementById("stremioPassword").value = "";
+    setStatus(statusEl, "Linking Stremio&hellip;", "info");
+    $("stremioPassword").value = "";
 
     fetch(WORKER_URL + "/stremio-login", {
       method: "POST",
@@ -537,9 +637,10 @@
           stremioKey = r.body.authKey;
           setStatus(statusEl,
             "Stremio linked" + (r.body.user && r.body.user.email ? " as " + escapeHtml(r.body.user.email) : "") +
-            " &mdash; Nuvio progress will resume inside Stremio.", "ok");
-          document.getElementById("stremioSignin").style.display = "none";
-          document.getElementById("skipStremio").style.display = "none";
+            " &mdash; Nuvio progress will now resume inside Stremio.", "ok");
+          $("stremioSignin").style.display = "none";
+          $("skipStremio").style.display = "none";
+          $("stremioLink").scrollIntoView({ behavior: "smooth", block: "start" });
         } else {
           setStatus(statusEl, "Stremio link failed" + (r.body && r.body.error ? ": " + escapeHtml(r.body.error) : ""), "err");
         }
@@ -549,12 +650,6 @@
       });
   }
 
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-    });
-  }
-
   // ---- Advanced manual-token path --------------------------------------------
   function useManualToken() {
     var t = tokenInput.value.trim();
@@ -562,7 +657,7 @@
     accessToken = t;
     setStatus(signinStatus, "Using the pasted token.", "ok");
     signedInAs.style.display = "block";
-    document.getElementById("stremioLink").style.display = "block";
+    $("stremioLink").classList.remove("hidden");
   }
 
   // ---- QR code (optional enhancement) ---------------------------------------
@@ -576,7 +671,7 @@
     } catch (e) { /* ignore */ }
   }
 
-  // ---- Generate ---------------------------------------------------------------
+  // ---- Generate ----------------------------------------------------------------
   function generate() {
     if (!accessToken) {
       setStatus(signinStatus, "Sign in to Nuvio first.", "err");
@@ -585,26 +680,30 @@
     var url = buildAddonUrl(accessToken);
     addonUrlInput.value = url;
     // The self-check lives at the same path with /manifest.json swapped out.
-    document.getElementById("debugLink").href = url.replace(/\/manifest\.json$/, "/debug");
-    urlBox.classList.add("show");
-    installCard.style.display = "block";
+    debugLink.href = url.replace(/\/manifest\.json$/, "/debug");
+    urlBox.classList.remove("hidden");
     renderQr(url);
+    urlBox.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  // ---- Wiring -----------------------------------------------------------------
+  // ---- Wiring -------------------------------------------------------------------
   signinBtn.addEventListener("click", signIn);
-  // Enter in the password field submits.
-  passwordInput.addEventListener("keydown", function (e) {
-    if (e.key === "Enter") signIn();
+  passwordInput.addEventListener("keydown", function (e) { if (e.key === "Enter") signIn(); });
+  $("stremioSignin").addEventListener("click", stremioSignIn);
+  $("stremioPassword").addEventListener("keydown", function (e) { if (e.key === "Enter") stremioSignIn(); });
+  $("skipStremio").addEventListener("click", function () {
+    $("stremioLink").classList.add("hidden");
+    setStatus($("stremioStatus"), "", "");
   });
   useTokenBtn.addEventListener("click", useManualToken);
   resetBtn.addEventListener("click", function () {
     try { localStorage.removeItem(LS_KEY); } catch (e) {}
     emailInput.value = ""; passwordInput.value = ""; profileInput.value = "1";
-    accessToken = null;
+    accessToken = null; stremioKey = null;
     signedInAs.style.display = "none";
-    urlBox.classList.remove("show"); installCard.style.display = "none";
-    setStatus(signinStatus, "Saved details cleared.", "");
+    $("stremioLink").classList.add("hidden");
+    urlBox.classList.add("hidden");
+    setStatus(signinStatus, "Saved details cleared.", "info");
   });
   copyBtn.addEventListener("click", function () {
     addonUrlInput.select();
@@ -616,14 +715,6 @@
     }
   });
   generateBtn.addEventListener("click", generate);
-  document.getElementById("stremioSignin").addEventListener("click", stremioSignIn);
-  document.getElementById("stremioPassword").addEventListener("keydown", function (e) {
-    if (e.key === "Enter") stremioSignIn();
-  });
-  document.getElementById("skipStremio").addEventListener("click", function () {
-    document.getElementById("stremioLink").style.display = "none";
-    setStatus(document.getElementById("stremioStatus"), "", "");
-  });
 
   loadPrefs();
 })();
