@@ -699,6 +699,15 @@ function buildStremioLibraryItem(row, cfg) {
   const videoId = row.video_id || row.content_id;
   const name = row.content_id; // the client resolves the real title itself
   const poster = null;
+  // lastWatched carries the SOURCE timestamp (Nuvio's last_watched), not "now".
+  // This is what makes the bridge idempotent: after Nuvio -> Stremio, both
+  // sides hold the same logical timestamp, so the reverse pass can never
+  // mistake our own write for a newer Stremio position and bounce it back
+  // (which would ping-pong forever, bumping timestamps each cycle).
+  // _mtime stays "now" - Stremio's own sync uses it to notice the change.
+  const sourceLastWatched = row.last_watched
+    ? new Date(row.last_watched).toISOString()
+    : isoNow();
   const now = isoNow();
 
   return {
@@ -712,7 +721,7 @@ function buildStremioLibraryItem(row, cfg) {
     _ctime: now,
     _mtime: now,
     state: {
-      lastWatched: isoNow(),
+      lastWatched: sourceLastWatched,
       timeWatched: position,
       timeOffset: position,
       overallTimeWatched: position,
@@ -773,12 +782,14 @@ function mergeStremioItem(item, existing) {
 function isNewerThanStremio(row, existing) {
   if (!existing || !existing.state) return true;
   const stremioOffset = toInt(existing.state.timeOffset, 0);
-  const stremioLast = existing.state.lastWatched ? Date.parse(existing.state.lastWatched) : 0;
+  const stremioLast = existing.state.lastWatched ? (Date.parse(existing.state.lastWatched) || 0) : 0;
   const nuvioLast = toInt(row.last_watched, 0);
-  // Same position already stored -> nothing to do.
-  if (stremioOffset === toInt(row.position, 0) && stremioLast >= nuvioLast) return false;
-  // No timestamps to compare -> write if the position differs.
-  if (!nuvioLast && !stremioLast) return stremioOffset !== toInt(row.position, 0);
+  const nuvioPos = toInt(row.position, 0);
+
+  // Identical position, and Stremio is at least as recent -> already synced.
+  if (nuvioPos === stremioOffset && (!nuvioLast || stremioLast <= nuvioLast)) return false;
+  // Nuvio has no usable timestamp: trust the source when the position differs.
+  if (!nuvioLast) return nuvioPos !== stremioOffset;
   return nuvioLast > stremioLast;
 }
 
@@ -1170,6 +1181,81 @@ async function pullLibraryMeta(cfg, token, profileId, stremioKey) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Read the user's Stremio positions as Nuvio-shaped progress rows.
+ *
+ * Stremio's own library stores the live playback position of everything
+ * watched in Stremio (`state.timeOffset` / `state.duration` / `state.lastWatched`),
+ * so this is the Stremio -> Nuvio source. It works whether or not the client
+ * emits player events - which is the whole point: it removes the dependency
+ * on the client volunteering its position.
+ */
+async function pullStremioProgress(cfg, stremioKey) {
+  const items = await stremioDatastoreGet(cfg, stremioKey, []);
+  const rows = [];
+  for (const it of Array.isArray(items) ? items : []) {
+    if (!it || typeof it._id !== 'string' || !/^tt\d/.test(it._id)) continue;
+    const st = it.state || {};
+    const position = toInt(st.timeOffset, 0);
+    const duration = toInt(st.duration, 0);
+    if (position <= 0 || duration <= 0) continue; // nothing resumable
+    const type = it.type === 'series' ? 'series' : 'movie';
+    const videoId = type === 'series' ? (st.video_id || it._id) : it._id;
+    rows.push({
+      content_id: it._id,
+      content_type: type,
+      video_id: videoId,
+      position,
+      duration,
+      last_watched: st.lastWatched ? (Date.parse(st.lastWatched) || 0) : 0,
+    });
+  }
+  return rows;
+}
+
+/** Stremio row newer than Nuvio's copy? (mirror of isNewerThanStremio) */
+function isNewerThanNuvio(stremioRow, nuvioRow) {
+  if (!nuvioRow) return true;
+  const nuvioPos = toInt(nuvioRow.position, 0);
+  const nuvioLast = toInt(nuvioRow.last_watched, 0);
+  const stremioLast = stremioRow.last_watched || 0;
+  const stremioPos = toInt(stremioRow.position, 0);
+
+  // Identical position, and Nuvio at least as recent -> already synced.
+  if (nuvioPos === stremioPos && (!stremioLast || nuvioLast <= stremioLast)) return false;
+  // Stremio has no usable timestamp: trust the source when the position differs.
+  if (!stremioLast) return nuvioPos !== stremioPos;
+  return stremioLast > nuvioLast;
+}
+
+/**
+ * Push the user's Stremio positions into Nuvio. `nuvioRows` is the current
+ * Nuvio state (already fetched by the caller) used for conflict resolution.
+ */
+async function syncStremioToNuvio(cfg, token, profileId, stremioRows, nuvioRows) {
+  if (!Array.isArray(stremioRows) || !stremioRows.length) return { written: 0 };
+
+  const byId = new Map();
+  for (const r of nuvioRows || []) if (r && r.content_id) byId.set(r.content_id, r);
+
+  let written = 0;
+  for (const row of stremioRows.slice(0, STREMIO_WRITE_BATCH)) {
+    if (!isNewerThanNuvio(row, byId.get(row.content_id))) continue;
+    try {
+      const entry = buildProgressEntry(row.content_type, row.video_id, row.position, row.duration);
+      entry.last_watched = row.last_watched || Date.now();
+      await pushProgress(cfg, token, profileId, entry);
+      written += 1;
+      const pct = Math.round((row.position / Math.max(row.duration, 1)) * 100);
+      noteActivity('push-nuvio', `${entry.content_id} at ${pct}% (from Stremio)`);
+      console.log(`[stremio->nuvio] pushed ${entry.content_id} at ${pct}%`);
+    } catch (err) {
+      console.error(`[stremio->nuvio] push failed for ${row.content_id}: ${err.message}`);
+    }
+  }
+  return { written };
+}
+
+/**
  * Pull the user's Nuvio progress and write it into their Stremio account.
  *
  * Called when either app requests the manifest - i.e. on app open and on the
@@ -1183,16 +1269,32 @@ async function pullLibraryMeta(cfg, token, profileId, stremioKey) {
 async function autoSyncFromManifest(cfg, token, profileId, stremioKey) {
   try {
     const metaMap = await pullLibraryMeta(cfg, token, profileId, stremioKey);
-    let rows = [];
+
+    // Current state of both sides.
+    let nuvioRows = [];
     try {
-      rows = await pullProgress(cfg, token, profileId, CATALOG_LIMIT);
+      nuvioRows = await pullProgress(cfg, token, profileId, CATALOG_LIMIT);
     } catch (err) {
-      console.error(`[auto-sync] progress pull failed: ${err.message}`);
+      console.error(`[auto-sync] Nuvio pull failed: ${err.message}`);
       return;
     }
-    const { written } = await syncProgressToStremio(cfg, stremioKey, rows, metaMap);
-    console.log(`[auto-sync] manifest-triggered sync complete: ${written} resume point(s) written`);
-    noteActivity('auto-sync', `manifest-triggered: ${written} resume point(s) written`);
+
+    // Direction 1: Nuvio -> Stremio (resume points for the Nuvio side).
+    const { written } = await syncProgressToStremio(cfg, stremioKey, nuvioRows, metaMap);
+
+    // Direction 2: Stremio -> Nuvio (positions from the Stremio account).
+    // Read from the account, NOT from player events: this works even when the
+    // client never emits them, which is what made this direction dead.
+    let pushed = 0;
+    try {
+      const stremioRows = await pullStremioProgress(cfg, stremioKey);
+      pushed = (await syncStremioToNuvio(cfg, token, profileId, stremioRows, nuvioRows)).written;
+    } catch (err) {
+      console.error(`[auto-sync] Stremio pull failed: ${err.message}`);
+    }
+
+    console.log(`[auto-sync] manifest-triggered sync: ${written} written to Stremio, ${pushed} pushed to Nuvio`);
+    noteActivity('auto-sync', `${written} to Stremio + ${pushed} to Nuvio`);
   } catch (err) {
     console.error(`[auto-sync] failed: ${err.message}`);
   }
