@@ -83,11 +83,19 @@ const STREMIO_API_DEFAULT = 'https://api.strem.io/api';
 
 /**
  * Library item shape used when writing progress into Stremio.
- * `temp: true` keeps the item out of the user's library while still storing
- * the resume point (mirrors what Stremio itself does for played-but-not-added
- * titles). Set STREMIO_PROGRESS_TEMP=false to also pin items into the library.
+ *
+ * DEFAULT IS NOW `false` (= a real library item), because this is what makes
+ * the automatic path work: Stremio's own native Continue Watching is built
+ * from library items, so a title watched in Nuvio only appears there
+ * automatically when it is written as a library item. Writing it as a `temp`
+ * item stores the position (and our own catalog row can display it) but the
+ * native board ignores it - which is exactly why "some movies show up and
+ * some don't".
+ *
+ * Set STREMIO_PROGRESS_TEMP=true to go back to temp items (progress stored,
+ * nothing pinned into the library).
  */
-const STREMIO_PROGRESS_TEMP_DEFAULT = true;
+const STREMIO_PROGRESS_TEMP_DEFAULT = false;
 
 /**
  * METADATA POLICY: we deliberately do NOT fetch or proxy metadata.
@@ -659,6 +667,40 @@ function buildStremioLibraryItem(row, cfg) {
 }
 
 /**
+ * Merge our progress item into the item Stremio already has, if any.
+ *
+ * Why merge instead of overwrite: the user's Stremio account may already hold
+ * the real metadata for this title (name, poster, behaviorHints) resolved by
+ * the client's own meta addons, plus a `watched` bitfield marking episodes
+ * seen. Blindly overwriting would (a) replace real titles with our bare tt id
+ * and (b) destroy the watched bitfield. So existing data wins for everything
+ * except the playback state we are explicitly here to update.
+ *
+ * Also: an existing `temp` item is promoted to a library item and a `removed`
+ * item is re-added - both mirror what Stremio itself does when you play
+ * something (playing a title puts it back in your library).
+ */
+function mergeStremioItem(item, existing) {
+  if (!existing) return item;
+
+  const state = { ...(existing.state || {}), ...item.state };
+  // Never clobber the watched bitfield (episode-level watched state).
+  if (existing.state && existing.state.watched != null) {
+    state.watched = existing.state.watched;
+  }
+
+  return {
+    ...item,            // our defaults
+    ...existing,        // existing metadata wins (real name/poster/etc.)
+    _ctime: existing._ctime || item._ctime,
+    _mtime: item._mtime,
+    temp: item.temp,    // config-driven (default: a real library item)
+    removed: false,     // playing re-adds it, like Stremio does
+    state,
+  };
+}
+
+/**
  * Is this Nuvio progress row newer than what Stremio already has?
  * Prevents redundant writes (each datastorePut is a request against the
  * free-tier budget, and pointless writes would churn the user's account).
@@ -706,11 +748,16 @@ async function syncProgressToStremio(cfg, stremioKey, rows) {
     }
 
     for (const row of candidates) {
-      if (!isNewerThanStremio(row, byId.get(row.content_id))) continue;
+      const existing = byId.get(row.content_id);
+      if (!isNewerThanStremio(row, existing)) continue;
       try {
-        await stremioDatastorePut(cfg, stremioKey, [buildStremioLibraryItem(row, cfg)]);
+        const merged = mergeStremioItem(buildStremioLibraryItem(row, cfg), existing);
+        await stremioDatastorePut(cfg, stremioKey, [merged]);
         written += 1;
-        console.log(`[stremio] wrote resume point for ${row.content_id} @ ${toInt(row.position, 0)}ms`);
+        console.log(
+          `[stremio] wrote resume point for ${row.content_id} @ ${toInt(row.position, 0)}ms ` +
+          `(${existing ? 'merged into existing ' + (existing.temp ? 'temp' : 'library') + ' item' : 'new library item'})`
+        );
       } catch (err) {
         console.error(`[stremio] write failed for ${row.content_id}: ${err.message}`);
       }
