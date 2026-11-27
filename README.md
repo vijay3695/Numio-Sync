@@ -1,19 +1,50 @@
 # Numio Sync
 
-A free bridge that keeps playback position in sync between **Stremio** and **Nuvio** — in both directions. Watch in one app, resume in the other, at the exact position.
+Watch a movie in one app, open the other, and continue at the exact same spot. Numio Sync keeps playback position and watched state in step between **Stremio** and **Nuvio** — in both directions.
 
-**Website:** https://numio.vijay3695.workers.dev
+**Use it now:** https://numio.vijay3695.workers.dev
 
-Open the website, sign in with your own Nuvio and Stremio accounts, generate one add-on link, and install that same link in both apps. Nothing is stored: no database, no accounts, no watch history kept anywhere.
+![Numio Sync sign-in page](docs/sign-in.jpeg)
 
-- Free to use, powered by Cloudflare's free tier
-- Works on Android, Android TV, Firestick, iOS, and desktop
-- Progress and watched state move both ways
-- No tracking, no third-party metadata requests
+## At a glance
 
-**Support**
+| | |
+|---|---|
+| Website | https://numio.vijay3695.workers.dev |
+| Cost | Free to use |
+| Data stored | Nothing — no database, no accounts, no tracking |
+| Platforms | Android, Android TV, Firestick, iOS, desktop |
+| Setup | One add-on link, installed in both apps |
 
-- Buy me a coffee: https://buymeacoffee.com/vijay3695
-- Developer: https://github.com/vijay3695
+## What it does
 
-© 2026 Vijay Kumar. All rights reserved. The source code is private and is not licensed for use, copying, modification, or distribution.
+- Your place in a movie or show is saved as you play, pause, seek, or close the player — even if the app exits suddenly.
+- Progress made in Stremio shows up in Nuvio, and progress made in Nuvio shows up in Stremio's own Continue Watching.
+- Marking something as watched in one app is reflected in the other.
+- One extra **Numio Sync** row in Stremio shows titles you have not finished in Nuvio.
+
+## Get started
+
+1. Open the website and sign in with your Nuvio account.
+2. Link your Stremio account. This step is needed so progress can resume inside Stremio.
+3. Generate your add-on link — it is unique to your accounts.
+4. Paste that same link into **Stremio** (Add-ons) and **Nuvio** (Settings → Content & Discovery → Addons). On Nuvio TV, scan the QR code from the website.
+
+![Generated link and install instructions](docs/install.jpeg)
+
+After installing, open either app and your progress will be up to date in both.
+
+## Privacy
+
+Your login details stay inside the private add-on link that only you have. Nothing is stored on our side: no database, no accounts, no analytics. To stop syncing at any time, remove the add-on from both apps.
+
+## Support
+
+Numio Sync is free to use. If it saves you time, you can support it here:
+
+- [Buy me a coffee](https://buymeacoffee.com/vijay3695)
+- [Developer profile](https://github.com/vijay3695)
+
+## License
+
+© 2026 Vijay Kumar. All rights reserved. This repository contains public project information only. The source code is private and is not licensed for use, copying, modification, or distribution.
