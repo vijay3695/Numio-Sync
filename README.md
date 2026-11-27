@@ -38,6 +38,10 @@ After installing, open either app and your progress will be up to date in both.
 
 Your login details stay inside the private add-on link that only you have. Nothing is stored on our side: no database, no accounts, no analytics. To stop syncing at any time, remove the add-on from both apps.
 
+## Troubleshooting
+
+If the **Numio Sync** row in Stremio says "Session expired", your Nuvio login has timed out. Reopen the website, sign in again, generate a fresh link, and install it in both apps.
+
 ## Support
 
 Numio Sync is free to use. If it saves you time, you can support it here:
